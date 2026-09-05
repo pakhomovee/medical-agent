@@ -8,7 +8,8 @@ venv/
 data/refsol.py
 **/refsol.py
 
-# Large / generated
+# Large / generated. Sweep artifacts only -- small gate reports live in results/,
+# which IS committed: they are the evidence behind a gate decision.
 runs/
 data/*.safetensors
 *.log

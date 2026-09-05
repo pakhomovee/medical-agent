@@ -1,0 +1,109 @@
+{
+  "tasks": {
+    "file": "data/test_data_v2.json",
+    "n_tasks": 300,
+    "n_templates": 10,
+    "instances_per_template": {
+      "30": 10
+    },
+    "n_distinct_patients": 98,
+    "n_tasks_with_sol": 30,
+    "templates": [
+      {
+        "key": "task1",
+        "n_instances": 30,
+        "is_action": false,
+        "is_conditional": true,
+        "masked_instruction": "What's the MRN of the patient with name <NAME> and DOB of <DATE>? If the patient does not exist, the answer should be <QUOTED>"
+      },
+      {
+        "key": "task2",
+        "n_instances": 30,
+        "is_action": false,
+        "is_conditional": false,
+        "masked_instruction": "What's the age of the patient with MRN of <MRN>?"
+      },
+      {
+        "key": "task3",
+        "n_instances": 30,
+        "is_action": true,
+        "is_conditional": false,
+        "masked_instruction": "I just measured the blood pressure for patient with MRN of <MRN>, and it is <QUOTED>. Help me record it."
+      },
+      {
+        "key": "task4",
+        "n_instances": 30,
+        "is_action": false,
+        "is_conditional": false,
+        "masked_instruction": "What's the most recent magnesium level of the patient <MRN> within last <NUM> hours?"
+      },
+      {
+        "key": "task5",
+        "n_instances": 30,
+        "is_action": true,
+        "is_conditional": true,
+        "masked_instruction": "Check patient <MRN>'s last serum magnesium level within last <NUM> hours. If low, then order replacement IV magnesium according to dosing instructions. If no magnesium level has been recorded in the l"
+      },
+      {
+        "key": "task6",
+        "n_instances": 30,
+        "is_action": false,
+        "is_conditional": false,
+        "masked_instruction": "What is the average CBG of the patient <MRN> over the last <NUM> hours?"
+      },
+      {
+        "key": "task7",
+        "n_instances": 30,
+        "is_action": false,
+        "is_conditional": false,
+        "masked_instruction": "What is the most recent CBG of the patient <MRN>?"
+      },
+      {
+        "key": "task8",
+        "n_instances": 30,
+        "is_action": true,
+        "is_conditional": false,
+        "masked_instruction": "Order orthopedic surgery referral for patient <MRN>. Specify within the free text of the referral, \"Situation: acute left knee injury, Background: radiology report indicates ACL tear. Assessment: ACL "
+      },
+      {
+        "key": "task9",
+        "n_instances": 30,
+        "is_action": true,
+        "is_conditional": true,
+        "masked_instruction": "Check patient <MRN>'s most recent potassium level. If low, then order replacement potassium according to dosing instructions. Also pair this order with a morning serum potassium level to be completed "
+      },
+      {
+        "key": "task10",
+        "n_instances": 30,
+        "is_action": true,
+        "is_conditional": true,
+        "masked_instruction": "What's the last HbA1C (hemoglobin A1C) value in the chart for patient <MRN> and when was it recorded? If the lab value result date is greater than <NUM> year old, order a new HbA1C lab test."
+      }
+    ],
+    "n_action_templates": 5,
+    "n_query_templates": 5,
+    "n_conditional_templates": 4,
+    "n_action_instances": 150,
+    "template_agreement": {
+      "n_id_groups": 10,
+      "n_mask_groups": 10,
+      "categories_split_across_masks": {},
+      "masks_spanning_categories": {},
+      "consistent": true
+    }
+  },
+  "refsol": null,
+  "verdict": {
+    "templating_confirmed": true,
+    "n_action_templates": 5,
+    "grader_invertibility_feasible": null,
+    "gate": "PASS",
+    "notes": [
+      "Templating CONFIRMED: 300 tasks over 10 templates; id-grouping and mask-grouping agree.",
+      "Effective clusters for action-task analysis: 5 (150 instances). Task-clustered bootstrap resamples templates, so this -- not the instance count -- bounds power.",
+      "FEWER THAN 8 ACTION TEMPLATES: ranking estimator families is not achievable. State RQ1 as 'does any estimator beat chance, and by how much'. Note that test_data_v1.json is a strict SUBSET of test_data_v2.json, so combining them adds no clusters -- more templates would have to come from the PSB 2026 task set (ericoericochen/medagentbenchv2), which is a separate acquisition.",
+      "Only 30/300 tasks carry a 'sol'. Grading is impossible without refsol.py -- do not report a success rate without it.",
+      "refsol.py absent: grader invertibility UNRESOLVED. Download it from the Box link in the upstream README (and never commit it)."
+    ]
+  }
+}

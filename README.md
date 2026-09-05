@@ -36,7 +36,7 @@ constraint — see plan §6.1 on agreeing a gated release.
 
 ```bash
 .venv/bin/python scripts/g1_task_structure.py --tasks data/test_data_v2.json \
-    --refsol data/refsol.py --out runs/g1_v2.json
+    --refsol data/refsol.py --out results/g1_v2.json
 ```
 
 Answers whether tasks are parameterised templates (which bounds statistical power) and
@@ -44,7 +44,7 @@ whether graders can be inverted to a gold action (which the correct-and-continue
 design depends on). **Run this before anything else** — it has no dependencies and it is
 the question that most changes the thesis.
 
-Result on the shipped data, already recorded in `runs/g1_v2.json`:
+Result on the shipped data, recorded in `results/g1_v2.json`:
 
 | | v1 | v2 |
 |---|---|---|
@@ -76,7 +76,7 @@ vllm serve <MODEL> --dtype bfloat16 --max-model-len 8192 \
   --enable-prefix-caching --no-enable-chunked-prefill
 
 .venv/bin/python scripts/g0_environment.py --fhir http://localhost:8080/fhir \
-    --base-url http://localhost:8000/v1 --determinism-trials 8 --out runs/g0.json
+    --base-url http://localhost:8000/v1 --determinism-trials 8 --out results/g0.json
 ```
 
 `--enable-prefix-caching` because k resampled actions at a turn share a long identical
@@ -150,6 +150,8 @@ uqma/inference/            base · openai_compat (vllm serve) · stub (no GPU)
 scripts/                   g0_environment.py · g1_task_structure.py · g2_model_gate.py
                            run_agent.py (stage 1)
 tests/                     98 tests, no GPU or network required
+results/                   small gate reports (committed -- decision evidence)
+runs/                      sweep artifacts (gitignored -- 1-2 TB)
 ```
 
 The pipeline is six stages, each reading and writing durable artifacts so the expensive

@@ -202,7 +202,7 @@ SPIKE B — TASK STRUCTURE                    ANSWERED 2026-09-05 (scripts/g1_ta
   graders read the transcript (invertibility) .... [ ] yes  [ ] no
   gold trajectories exist ........................ [ ] yes  [ ] no   (expect no)
     -> rerun: python scripts/g1_task_structure.py --tasks data/test_data_v2.json \
-                --refsol data/refsol.py --out runs/g1_v2.json
+                --refsol data/refsol.py --out results/g1_v2.json
 
 SPIKE C — MODEL GATE                                     date: __________
   model              action SR   query SR   valid-call%   turns   tok/s
