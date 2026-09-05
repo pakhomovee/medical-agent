@@ -81,3 +81,38 @@ def parse_finish_list(payload: str | None) -> list | None:
     except (json.JSONDecodeError, ValueError):
         return None
     return value if isinstance(value, list) else [value]
+
+
+def canonical_action(action: Action) -> str:
+    """A canonical string for an action, so two samples can be compared exactly.
+
+    Structured tool calls are what make semantic entropy cheap in this environment: two
+    generations mean the same thing iff they are the same call with the same arguments,
+    so no natural-language-inference model is needed to decide equivalence (proposal
+    §6.2). That only holds if incidental differences are normalised away first --
+    query-parameter order, JSON key order, whitespace.
+
+    Returns a string rather than a hash so that logs stay inspectable.
+    """
+    if action.kind is ActionKind.GET:
+        return f"get {_canonical_url(action.url or '')}"
+    if action.kind is ActionKind.POST:
+        try:
+            payload = json.loads(action.post_body or "")
+        except (json.JSONDecodeError, ValueError):
+            return "post <unparseable>"
+        return "post " + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    if action.kind is ActionKind.FINISH:
+        parsed = parse_finish_list(action.finish_payload)
+        if parsed is None:
+            return f"finish {(action.finish_payload or '').strip()}"
+        return "finish " + json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+    return "invalid"
+
+
+def _canonical_url(url: str) -> str:
+    base, _, query = url.partition("?")
+    if not query:
+        return base.rstrip("&")
+    params = sorted(p for p in query.split("&") if p and p != "_format=json")
+    return base + ("?" + "&".join(params) if params else "")

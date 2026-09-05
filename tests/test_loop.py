@@ -137,7 +137,7 @@ def test_opening_message_is_a_user_message(task):
 def test_turn_records_carry_logprobs_and_prefix_source(task):
     episode = run(task, ["FINISH([])"])
     turn = episode.turns[0]
-    assert turn.logprobs is not None and len(turn.logprobs) > 0
+    assert turn.token_logprobs is not None and len(turn.token_logprobs) > 0
     assert turn.prefix_source == "rollout"
 
 

@@ -1,23 +1,21 @@
 """The instrumented ReAct loop.
 
-This replaces upstream's controller/worker/assigner machinery (plan §6.1): we need
-per-token logprobs, k-resampling with history pinned, and a teacher-forced second pass,
-none of which survive an HTTP boundary between us and the model.
+Replaces upstream's controller/worker/assigner machinery (plan §6.1): we need per-token
+logprobs, k-resampling with history pinned, and a teacher-forced second pass, none of
+which survive an HTTP boundary between us and the model.
 
-Episode semantics are copied from upstream so that gate G4 can compare per-task outcomes:
-``max_round`` defaults to 5 (upstream's default -- note the proposal text says 8, which
-Spike A must resolve), an unrecognised action terminates the episode, and a malformed
-POST body does not.
+Episode semantics are copied from upstream so gate G4 can compare per-task outcomes:
+``max_round`` defaults to 5 (the proposal says 8; Spike A resolves), an unrecognised
+action terminates the episode, and a malformed POST body does not.
 
-Instrumentation beyond upstream is additive and optional: turn records carry the raw
-generation and, when the backend supplies them, token logprobs. Nothing here computes an
-uncertainty score -- that is stage 4, off the logged artifact (plan §6.2).
+Instrumentation beyond upstream is additive: turns carry the raw generation, token
+logprobs, and optionally k resampled alternatives. Nothing here computes an uncertainty
+score -- that is stage 4, off the logged artifact (plan §6.2).
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass, field
 
 from ..envs.medagentbench.fhir import FhirClient, PostCheck, check_post_payload
 from ..envs.medagentbench.prompts import (
@@ -29,78 +27,16 @@ from ..envs.medagentbench.prompts import (
 )
 from ..envs.medagentbench.tasks import Task
 from ..inference.base import Backend, Generation
-from .parsing import Action, ActionKind, parse
+from ..trajectory.schema import EpisodeStatus, PrefixSource, Trajectory, Turn
+from .parsing import Action, ActionKind, canonical_action, parse
+from .resample import resample_turn
 
-# Episode outcomes, named to match upstream's SampleStatus.
-STATUS_COMPLETED = "completed"
-STATUS_INVALID_ACTION = "agent_invalid_action"
-STATUS_LIMIT_REACHED = "task_limit_reached"
-STATUS_CONTEXT_LIMIT = "agent_context_limit"
-STATUS_ERROR = "task_error"
-
-
-@dataclass
-class TurnRecord:
-    """One assistant turn plus the observation it produced.
-
-    ``prefix_source`` is reserved for prefix seeding (plan §4.3). It is always
-    ``"rollout"`` today; the field exists now because adding it later means migrating a
-    terabyte of logs.
-    """
-
-    index: int
-    prompt_messages: list[dict]
-    generation: str
-    action_kind: str
-    action_raw: str
-    observation: str | None
-    url: str | None = None
-    post_check: dict | None = None
-    logprobs: list[float] | None = None
-    prefix_source: str = "rollout"
-    latency_s: float = 0.0
-    n_generated_tokens: int | None = None
-
-
-@dataclass
-class Episode:
-    task_id: str
-    category: str
-    status: str
-    result: str | None
-    turns: list[TurnRecord] = field(default_factory=list)
-    history: list[dict] = field(default_factory=list)
-    error: str | None = None
-    wall_s: float = 0.0
-
-    @property
-    def n_turns(self) -> int:
-        return len(self.turns)
-
-    @property
-    def n_post_attempts(self) -> int:
-        return sum(1 for t in self.turns if t.action_kind == ActionKind.POST.value)
-
-    @property
-    def n_schema_valid_posts(self) -> int:
-        return sum(
-            1
-            for t in self.turns
-            if t.post_check is not None and t.post_check.get("schema_valid")
-        )
-
-    def to_dict(self) -> dict:
-        return {
-            "task_id": self.task_id,
-            "category": self.category,
-            "status": self.status,
-            "result": self.result,
-            "error": self.error,
-            "wall_s": round(self.wall_s, 3),
-            "n_turns": self.n_turns,
-            "turns": [asdict(t) for t in self.turns],
-            "history": self.history,
-        }
+# Re-exported so callers and tests need not reach into the enum.
+STATUS_COMPLETED = EpisodeStatus.COMPLETED.value
+STATUS_INVALID_ACTION = EpisodeStatus.AGENT_INVALID_ACTION.value
+STATUS_LIMIT_REACHED = EpisodeStatus.TASK_LIMIT_REACHED.value
+STATUS_CONTEXT_LIMIT = EpisodeStatus.AGENT_CONTEXT_LIMIT.value
+STATUS_ERROR = EpisodeStatus.TASK_ERROR.value
 
 
 def run_episode(
@@ -110,13 +46,27 @@ def run_episode(
     functions: list[dict],
     max_round: int = 5,
     capture_logprobs: bool = True,
-) -> Episode:
-    """Run one task to termination and return the full record."""
+    n_samples: int = 0,
+    sample_temperature: float = 1.0,
+    seed: int | None = None,
+    run_id: str | None = None,
+) -> Trajectory:
+    """Run one task to termination and return the full trajectory record.
+
+    ``n_samples`` > 0 additionally draws k alternative actions at each turn with the
+    history held fixed. Those alternatives are recorded but never executed: the episode
+    always continues along the greedy action, so sampling costs k x generation and does
+    not multiply environment interactions.
+    """
     started = time.monotonic()
     opening = build_prompt(task, functions, fhir.api_base)
     history: list[dict] = [{"role": "user", "content": opening}]
-    episode = Episode(
-        task_id=task.id, category=task.category, status=STATUS_LIMIT_REACHED, result=None
+    trajectory = Trajectory(
+        task_id=task.id,
+        category=task.category,
+        status=STATUS_LIMIT_REACHED,
+        seed=seed,
+        run_id=run_id,
     )
 
     try:
@@ -128,47 +78,57 @@ def run_episode(
             latency = time.monotonic() - turn_started
 
             if generation.truncated_by_context:
-                episode.status = STATUS_CONTEXT_LIMIT
+                trajectory.status = STATUS_CONTEXT_LIMIT
                 break
 
             action = parse(generation.text)
-            history.append({"role": "assistant", "content": generation.text})
+            samples = (
+                resample_turn(
+                    history, backend, k=n_samples, temperature=sample_temperature,
+                    capture_logprobs=capture_logprobs,
+                )
+                if n_samples > 0
+                else []
+            )
 
+            history.append({"role": "assistant", "content": generation.text})
             observation, post_check = _apply(action, fhir)
 
-            episode.turns.append(
-                TurnRecord(
+            trajectory.turns.append(
+                Turn(
                     index=turn_index,
-                    prompt_messages=list(history[:-1]),
                     generation=generation.text,
                     action_kind=action.kind.value,
                     action_raw=action.raw,
                     observation=observation,
                     url=action.url,
                     post_check=_post_check_dict(post_check),
-                    logprobs=generation.token_logprobs,
-                    latency_s=round(latency, 3),
+                    token_logprobs=generation.token_logprobs,
                     n_generated_tokens=generation.n_generated_tokens,
+                    finish_reason=generation.finish_reason,
+                    samples=samples,
+                    prefix_source=PrefixSource.ROLLOUT.value,
+                    latency_s=round(latency, 3),
                 )
             )
 
             if action.kind is ActionKind.FINISH:
-                episode.status = STATUS_COMPLETED
-                episode.result = action.finish_payload
+                trajectory.status = STATUS_COMPLETED
+                trajectory.result = action.finish_payload
                 break
             if action.kind is ActionKind.INVALID:
-                episode.status = STATUS_INVALID_ACTION
+                trajectory.status = STATUS_INVALID_ACTION
                 break
 
             history.append({"role": "user", "content": observation})
 
     except Exception as exc:  # upstream also collapses any error into a failed episode
-        episode.status = STATUS_ERROR
-        episode.error = f"{type(exc).__name__}: {exc}"
+        trajectory.status = STATUS_ERROR
+        trajectory.error = f"{type(exc).__name__}: {exc}"
 
-    episode.history = history
-    episode.wall_s = time.monotonic() - started
-    return episode
+    trajectory.history = history
+    trajectory.wall_s = time.monotonic() - started
+    return trajectory
 
 
 def _apply(action: Action, fhir: FhirClient) -> tuple[str | None, PostCheck | None]:
@@ -181,7 +141,7 @@ def _apply(action: Action, fhir: FhirClient) -> tuple[str | None, PostCheck | No
 
     if action.kind is ActionKind.POST:
         check = check_post_payload(action.post_body or "")
-        # Upstream branches only on JSON validity; the resource-type check is recorded
+        # Upstream branches only on JSON validity; our resource-type check is recorded
         # but must not change the observation, or parity breaks.
         return (POST_ACCEPTED if check.json_valid else POST_INVALID), check
 
@@ -198,3 +158,14 @@ def _post_check_dict(check: PostCheck | None) -> dict | None:
         "schema_valid": check.schema_valid,
         "error": check.error,
     }
+
+
+__all__ = [
+    "run_episode",
+    "canonical_action",
+    "STATUS_COMPLETED",
+    "STATUS_INVALID_ACTION",
+    "STATUS_LIMIT_REACHED",
+    "STATUS_CONTEXT_LIMIT",
+    "STATUS_ERROR",
+]

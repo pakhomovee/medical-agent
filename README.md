@@ -4,7 +4,7 @@ Instrumentation for the thesis described in
 `Turn-Level Uncertainty Quantification for Tool-Using Medical AI Agents — Thesis Proposal.md`.
 Execution plan: `~/.claude/plans/please-study-this-file-floating-dahl.md`.
 
-Current status: **gates G1 and G2 implemented.** G1 has been run and passes.
+Current status: **stage 1 built; gates G0, G1, G2 implemented.** G1 has been run and passes.
 
 ## Why this is not a fork of MedAgentBench
 
@@ -68,19 +68,53 @@ Two consequences, both already folded into the plan:
 - **`sol` is null for 9 of 10 templates**, so grading is impossible without `refsol.py`.
   G2 reports INCOMPLETE rather than 0% when it is absent.
 
-### G0 — environment and parity (GPU box)
+### G0 — environment readiness (GPU box)
 
 ```bash
 docker run -d -p 8080:8080 <hapi-fhir-image-from-upstream-readme>
-curl -s 'http://localhost:8080/fhir/Patient?_count=1' | head -c 300   # expect non-zero total
-
 vllm serve <MODEL> --dtype bfloat16 --max-model-len 8192 \
   --enable-prefix-caching --no-enable-chunked-prefill
+
+.venv/bin/python scripts/g0_environment.py --fhir http://localhost:8080/fhir \
+    --base-url http://localhost:8000/v1 --determinism-trials 8 --out runs/g0.json
 ```
 
 `--enable-prefix-caching` because k resampled actions at a turn share a long identical
 prompt. `--no-enable-chunked-prefill` because hidden-state extraction requires it, and G2
 throughput should be measured under the configuration real sweeps use.
+
+G0 checks four things:
+
+1. FHIR is up **and populated** — a live server with an empty dataset is the classic
+   silent failure, where every GET succeeds, returns nothing, and the model looks
+   incompetent.
+2. The model server returns **per-token logprobs**. They are the measurement instrument
+   for the whole thesis; finding them absent after a sweep is expensive.
+3. The serving flags above.
+4. **Logprob determinism.** vLLM is not bitwise deterministic across batch compositions,
+   so the same prompt can yield slightly different logprobs run to run. That puts a noise
+   floor under every estimator, and it can make the G4 parity check fail for reasons
+   unrelated to our code. `--determinism-trials` issues N identical temperature-0
+   requests and reports text divergence plus max/mean logprob drift. Client-side
+   repetition cannot control batch composition, so treat the number as a **lower bound**.
+
+### Stage 1 — sweeps
+
+```bash
+.venv/bin/python scripts/run_agent.py --tasks data/test_data_v2.json \
+    --backend vllm --base-url http://localhost:8000/v1 \
+    --fhir http://localhost:8080/fhir --refsol data/refsol.py \
+    --n-samples 10 --concurrency 8 --out runs/
+```
+
+Writes a run directory named `<date>-<model>-<confighash>` holding `manifest.json` (git
+SHA, dirty flag, resolved config, library versions), `trajectories.jsonl` and
+`run_stats.json`. Runs are immutable; `--resume <run_dir>` skips tasks already logged, so
+a sweep that dies at task 250 does not cost 250 tasks of GPU time to restart.
+
+`--n-samples k` draws k alternative actions per turn with history pinned. They are
+recorded, never executed, so sampling costs k× generation without multiplying environment
+interactions.
 
 ### G2 — model gate (GPU box)
 
@@ -110,15 +144,43 @@ metric rows are held in memory.
 
 ```
 uqma/envs/medagentbench/   tasks (template analysis) · prompts (verbatim) · fhir · grading
-uqma/agent/                parsing · loop
+uqma/agent/                parsing (+ canonicalisation) · loop · resample
+uqma/trajectory/           schema (SCHEMA_VERSION 1.0.0) · store (manifests, JSONL)
 uqma/inference/            base · openai_compat (vllm serve) · stub (no GPU)
-scripts/                   g1_task_structure.py · g2_model_gate.py
-tests/                     55 tests, no GPU or network required
+scripts/                   g0_environment.py · g1_task_structure.py · g2_model_gate.py
+                           run_agent.py (stage 1)
+tests/                     98 tests, no GPU or network required
 ```
 
 The pipeline is six stages, each reading and writing durable artifacts so the expensive
 GPU stage runs once and everything downstream is re-runnable on a laptop (plan §6.2).
-G1 and G2 are the front of stage 1; stages 2–6 are not built yet.
+Stage 1 is built; stages 2–6 are not.
+
+### The trajectory schema
+
+`uqma/trajectory/schema.py` is the load-bearing interface: stage 1 writes it, stages 2–6
+read it and never touch a model. `SCHEMA_VERSION` is stamped into every manifest and
+readers refuse a mismatch, so a change means writing a migration rather than teaching
+readers two shapes.
+
+Three deliberate choices:
+
+- **Hidden states are referenced, never inlined.** A sweep produces 1–2 TB of them; the
+  tabular log must stay small enough to load whole. `HiddenStateRef` is filled in by
+  stage 2, which is a separate pass — so changing which layers you extract costs one
+  cheap re-run instead of regenerating every trajectory.
+- **Per-turn prompts are reconstructed, not stored.** `Trajectory.prompt_for_turn(i)`
+  returns `history[:2i+1]`. Storing a copy per turn duplicates every prior FHIR response
+  once per subsequent turn — O(n²) in turn count, and FHIR bundles are large.
+- **Fields the plan anticipates exist now with defaults**: `prefix_source` for prefix
+  seeding (§4.3), `gated` / `injected_action` for correct-and-continue deferral (§4.2),
+  `error_class` for format-vs-clinical stratification (§4.4). Adding a field later means
+  migrating a terabyte of logs; adding it now costs a default value.
+
+Action canonicalisation (`uqma/agent/parsing.canonical_action`) normalises query-parameter
+order, JSON key order and whitespace so that two samples can be compared exactly. That is
+what makes semantic entropy cheap here — structured tool calls mean two generations agree
+iff they are the same call with the same arguments, so no NLI model is needed.
 
 ## Upstream behaviours preserved on purpose
 
@@ -141,6 +203,6 @@ registers as a parity failure:
 .venv/bin/python -m pytest tests/ -q
 ```
 
-No GPU, no network, no Docker. The three that matter per plan §6.4 are grader mutation
+98 tests. No GPU, no network, no Docker. The three that matter per plan §6.4 are grader mutation
 tests (not yet written — they need `refsol.py`), harness parity against upstream (gate G4,
 not yet written), and clustered-bootstrap coverage (stage 5, not yet built).
