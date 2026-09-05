@@ -143,7 +143,10 @@ def verdict(task_report: dict, refsol_report: dict | None) -> dict:
     if n_action_templates < 8:
         notes.append(
             "FEWER THAN 8 ACTION TEMPLATES: ranking estimator families is not achievable. "
-            "State RQ1 as 'does any estimator beat chance' and combine v1+v2 for clusters."
+            "State RQ1 as 'does any estimator beat chance, and by how much'. Note that "
+            "test_data_v1.json is a strict SUBSET of test_data_v2.json, so combining them "
+            "adds no clusters -- more templates would have to come from the PSB 2026 task "
+            "set (ericoericochen/medagentbenchv2), which is a separate acquisition."
         )
 
     if task_report["n_tasks_with_sol"] < task_report["n_tasks"]:
