@@ -47,14 +47,19 @@ from pathlib import Path
 REPO = "jyxsu6/medagentbench"
 TAG = "latest"
 
-# Tried in order. Docker Hub first where reachable; the rest are public pull-through
-# mirrors whose availability varies by region -- hence --check.
-REGISTRIES = [
-    "https://registry-1.docker.io",
+# Docker Hub only by default. Third-party pull-through mirrors are reachable with
+# --registry when Hub is blocked, but they are not in the default trust path: they are
+# operated by unknown parties and their availability varies by region. Whatever you use,
+# the manifest is checked against the pinned copy before anything downloads, so a mirror
+# cannot substitute content -- see verify_against_pin.
+REGISTRIES = ["https://registry-1.docker.io"]
+
+# Known public mirrors, for --check to probe when Docker Hub is unreachable. Listed as a
+# convenience, not an endorsement.
+KNOWN_MIRRORS = [
     "https://docker.m.daocloud.io",
     "https://docker.1ms.run",
     "https://docker.xuanyuan.me",
-    "https://dockerhub.icu",
 ]
 
 ACCEPT = ",".join([
@@ -368,6 +373,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tag", default=TAG)
     parser.add_argument("--check", action="store_true",
                         help="report which registries work from here, then exit")
+    parser.add_argument("--try-mirrors", action="store_true",
+                        help="also probe/use known third-party mirrors. Only needed where "
+                             "Docker Hub is blocked; content is still pin-verified")
     parser.add_argument("--offline", action="store_true",
                         help="extract from cached blobs; never open a socket")
     parser.add_argument("--timeout", type=float, default=45.0)
@@ -385,6 +393,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     registries = [r.rstrip("/") for r in (args.registry or REGISTRIES)]
+    if args.try_mirrors and not args.registry:
+        registries += KNOWN_MIRRORS
 
     if args.pin_manifest:
         manifest = fetch_manifest("https://registry-1.docker.io", args.repo, args.tag,

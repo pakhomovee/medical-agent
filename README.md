@@ -4,8 +4,9 @@ Instrumentation for the thesis described in
 `Turn-Level Uncertainty Quantification for Tool-Using Medical AI Agents — Thesis Proposal.md`.
 Execution plan: `~/.claude/plans/please-study-this-file-floating-dahl.md`.
 
-**Setting up a GPU box? Follow [RUNBOOK.md](RUNBOOK.md)** — every command in order, from
-a bare container to gate G2, with the known breakages and their fixes in one table.
+**Getting started:** open [`notebooks/uqma_colab.ipynb`](notebooks/uqma_colab.ipynb) in
+Colab (A100 recommended), or follow [RUNBOOK.md](RUNBOOK.md) for the same sequence as
+shell commands on any GPU box.
 
 Current status: **stage 1 built; gates G0, G1, G2 implemented.** G1 has been run and passes.
 
@@ -71,36 +72,41 @@ Two consequences, both already folded into the plan:
 - **`sol` is null for 9 of 10 templates**, so grading is impossible without `refsol.py`.
   G2 reports INCOMPLETE rather than 0% when it is absent.
 
-### The FHIR server without Docker
+### The FHIR server, without Docker
 
-Many GPU environments cannot run Docker at all — an AutoDL container drops
-`cap_sys_admin`, so `dockerd` can never start regardless of privileges, and Docker Hub is
-unreachable from some networks. Neither matters: the image is a Spring Boot HAPI FHIR war
-plus a preloaded H2 database, so it runs on a bare JVM.
+Colab and most managed GPU hosts do not allow Docker. Irrelevant: the MedAgentBench image
+is a Spring Boot HAPI FHIR war plus a preloaded H2 database, so a JVM is enough.
 
 ```bash
-apt-get install -y openjdk-17-jre-headless
-
-python scripts/fetch_fhir_server.py --check                 # which registries work here?
-python scripts/fetch_fhir_server.py --out ~/fhir --registry <one it reported>
-
-~/fhir/run.sh                                               # starts in ~70s
+bash scripts/bootstrap_fhir.sh ~/fhir
 ```
 
-The puller resolves the manifest, downloads and digest-verifies each layer (cached and
-resumable), applies whiteouts in order, and generates `run.sh` with the image's own
-entrypoint — rewriting the absolute `/data` and `/configs` paths to the extracted tree so
-no root-owned directories are needed.
+Idempotent. Installs Java if missing, pulls ~1.8 GB of layers, verifies each against a
+manifest pinned from Docker Hub, unpacks ~5 GB, starts the server detached, waits, and
+runs G0's FHIR half. Verified: 695 patients, 563k observations, 125k procedures, 75k
+conditions.
 
-Auth follows the `WWW-Authenticate` challenge on the 401 rather than assuming a token
-endpoint, so **any** mirror works: Docker Hub's realm is `auth.docker.io`, daocloud's is
-`/auth/token` on its own host, and hardcoding either breaks the other. Both are verified
-to return the same config digest, so a mirror serves identical content.
+**Supply chain.** Digest verification alone only proves a blob matches the manifest that
+named it — and that manifest comes from the same registry as the blobs, so a hostile
+mirror could serve a poisoned manifest plus matching poisoned layers and every check would
+pass. `data/medagentbench_image_manifest.json` is pinned from Docker Hub and compared
+against every resolved manifest before anything downloads. Default is Docker Hub only;
+`--try-mirrors` opts in to third-party pull-through mirrors for blocked networks, still
+pin-verified.
 
-**Budget ~6 GB of disk**: 1.8 GB compressed layers plus a 4.5 GB `test_db.mv.db`. Pass
-`--keep-blobs` to retain the cache, `--heap 1200m` if RAM is tight.
+`scripts/fetch_fhir_server.py --check` reports which registries serve both a manifest and
+a real blob from here — mirrors commonly resolve manifests and then 403 the blobs.
 
-Verified working: 695 patients, 563k observations, 125k procedures, 75k conditions.
+### GPU profile
+
+```bash
+.venv/bin/python scripts/gpu_profile.py
+```
+
+Prints the serve command matching the GPU. Catches two silent traps: **bfloat16 needs
+compute capability 8.0** (a Colab T4 is 7.5, and a silent fallback to float16 changes the
+measurement instrument — proposal §6.6), and an 8B model in 16-bit is ~16 GB, which does
+not fit a 16 GB card once the KV cache is counted.
 
 ### G0 — environment readiness (GPU box)
 
@@ -184,7 +190,7 @@ uqma/trajectory/           schema (SCHEMA_VERSION 1.0.0) · store (manifests, JS
 uqma/inference/            base · openai_compat (vllm serve) · stub (no GPU)
 scripts/                   g0_environment.py · g1_task_structure.py · g2_model_gate.py
                            run_agent.py (stage 1) · fetch_fhir_server.py
-tests/                     128 tests, no GPU or network required
+tests/                     169 tests, no GPU or network required
 results/                   small gate reports (committed -- decision evidence)
 runs/                      sweep artifacts (gitignored -- 1-2 TB)
 ```
@@ -240,7 +246,7 @@ registers as a parity failure:
 .venv/bin/python -m pytest tests/ -q
 ```
 
-98 tests. No GPU, no network, no Docker. 128 with `data/refsol.py` present, 115 + 13 skipped
+98 tests. No GPU, no network, no Docker. 169 with `data/refsol.py` present, 156 + 13 skipped
 without it, so a clean checkout still passes.
 
 Of the three the plan calls load-bearing (§6.4): **grader mutation tests are written**

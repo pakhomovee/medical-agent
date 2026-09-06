@@ -1,128 +1,92 @@
 # Runbook — bare GPU box to gate G2
 
-Every command in order. Written against an AutoDL container (no Docker, Docker Hub
-blocked), but the AutoDL-specific parts are marked and skippable elsewhere.
+Every command in order. Written for **Google Colab with an A100**, which is the clean
+path: bfloat16 is supported and Qwen3-8B fits. Other targets are in the appendix.
+
+For Colab specifically, `notebooks/uqma_colab.ipynb` is the same sequence as runnable
+cells — open that instead of copying from here.
 
 Gates: **G0** environment · **G1** task structure · **G2** model gate.
-G1 is already answered and committed (`results/g1_v2.json`); it needs no GPU.
 
 ---
 
-## 0. AutoDL networking — read this first
-
-AutoDL's accelerator is a proxy, and it is **mutually exclusive** with container
-registries:
-
-| Target | network_turbo |
-|---|---|
-| GitHub, HuggingFace | **ON** — `source /etc/network_turbo` |
-| Docker registries and mirrors | **OFF** — `unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY` |
-
-Most of the confusion in setup traces to having it the wrong way round. Keep two shells
-if that is easier than remembering.
-
----
-
-## 1. Repo and Python
+## 1. Repo and dependencies
 
 ```bash
-source /etc/network_turbo                     # AutoDL: ON for GitHub
-git clone <repo> ~/autodl-tmp/medical-agent
-cd ~/autodl-tmp/medical-agent
-
+git clone <repo> uqma && cd uqma
 python3 -m venv .venv --system-site-packages
 .venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m pytest tests/ -q          # expect ~131 passed, 13 skipped
+.venv/bin/python -m pytest tests/ -q          # ~156 passed, 13 skipped
 ```
 
-The 13 skips are the grader tests; they need `refsol.py`, which comes next.
+The package needs only `requests`; nothing heavy is imported outside the model server, so
+every stage except serving runs on a laptop. The 13 skips are the grader tests.
 
 ## 2. The answer key
 
-Download **https://stanfordmedicine.box.com/s/fizv0unyjgkb1r3a83rfn5p3dc673uho** in a
-browser and save it as `data/refsol.py`.
+Download **https://stanfordmedicine.box.com/s/fizv0unyjgkb1r3a83rfn5p3dc673uho** and save
+it as `data/refsol.py`. It is gitignored and **must never be committed** — MedAgentBench
+distributes it out-of-band to keep it out of training crawls, and our derived turn-level
+labels inherit that constraint.
+
+Nothing is gradable without it: `sol` is null for 9 of the 10 templates, so the graders
+recompute expected answers themselves.
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # now ~144 passed
+.venv/bin/python -m pytest tests/ -q          # now ~169 passed
+```
+
+## 3. Gate G1 — task structure
+
+No GPU, seconds. Run it before anything else: it bounds the statistical power available
+to the whole thesis.
+
+```bash
 .venv/bin/python scripts/g1_task_structure.py --tasks data/test_data_v2.json \
     --refsol data/refsol.py --out results/g1_v2.json
 ```
 
-`refsol.py` is gitignored and **must never be committed** — it is the answer key,
-distributed out-of-band to keep it out of training crawls.
+## 4. FHIR server
 
-## 3. FHIR server, no Docker
-
-Docker is unavailable in an AutoDL container: `cap_sys_admin` is dropped from the
-bounding set, so `dockerd` can never start regardless of user id. Irrelevant — the image
-is a Spring Boot war plus an H2 database and runs on a JVM.
+Colab has no Docker, and neither do most managed GPU hosts. Irrelevant — the
+MedAgentBench image is a Spring Boot HAPI FHIR war plus a preloaded H2 database, so a JVM
+is enough. One idempotent command does everything:
 
 ```bash
-apt-get install -y openjdk-17-jre-headless
-unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY   # AutoDL: OFF
-
-# which registries actually work from here? (~1 min)
-.venv/bin/python scripts/fetch_fhir_server.py --check
+bash scripts/bootstrap_fhir.sh ~/fhir
 ```
 
-It prints a ready-made `--registry` line. Use it:
+Installs Java if missing, pulls ~1.8 GB of image layers, verifies each against a manifest
+pinned from Docker Hub, unpacks ~5 GB, starts the server detached, waits for it, and runs
+G0's FHIR half. Re-running skips whatever is already done.
+
+Expect `[PASS]` with **695 patients · 563,426 observations · 21,991 medication requests ·
+124,969 procedures · 74,821 conditions**. Different numbers mean an incomplete extraction.
+
+**On trust:** digest verification alone only proves a blob matches the manifest that named
+it, and that manifest comes from the same registry as the blobs — so a hostile mirror
+could serve a poisoned manifest plus matching poisoned layers and every check would pass.
+`data/medagentbench_image_manifest.json` is pinned from Docker Hub and every resolved
+manifest is compared against it before a byte downloads. Default is Docker Hub only;
+`--try-mirrors` adds third-party pull-through mirrors for networks where Hub is blocked,
+still pin-verified. Never pass `--allow-manifest-drift` to work around a mismatch you
+cannot explain.
+
+If Docker Hub is unreachable, `scripts/fetch_fhir_server.py --check --try-mirrors` reports
+which registries serve both a manifest and a real blob, and prints the `--registry` line
+to use.
+
+## 5. Model server
 
 ```bash
-.venv/bin/python scripts/fetch_fhir_server.py --out ~/autodl-tmp/fhir \
-    --registry <first> --registry <second>
+.venv/bin/python scripts/gpu_profile.py
 ```
 
-~1.8 GB down, ~5 GB unpacked (the H2 database is 4.5 GB of it). Layers are cached and
-digest-verified, so an interrupted run resumes.
-
-**On trusting mirrors.** Digest verification alone only proves a blob matches the manifest
-that named it — and that manifest comes from the same registry as the blobs, so a hostile
-mirror could serve a poisoned manifest plus matching poisoned layers and every check would
-pass. `data/medagentbench_image_manifest.json` is pinned from Docker Hub and every
-resolved manifest is compared against it; a mismatch aborts before a byte is downloaded.
-That is what makes pulling through a third-party mirror safe. Refresh the pin only from
-Docker Hub (`--pin-manifest`), and never pass `--allow-manifest-drift` to work around a
-mismatch you have not explained.
-
-Consider running the server as an unprivileged user: it is a 326 MB WAR from a
-third-party image, and there is no reason for it to be root.
-
-Then:
+Prints the serve command for this GPU — correct dtype, largest model that fits, and the
+flags the sweeps need. On an A100 that is Qwen3-8B in bfloat16:
 
 ```bash
-setsid nohup ~/autodl-tmp/fhir/run.sh > ~/autodl-tmp/fhir/server.log 2>&1 < /dev/null &
-
-for i in $(seq 1 45); do
-  curl -sf --max-time 3 http://localhost:8080/fhir/metadata >/dev/null && { echo UP; break; }
-  sleep 5
-done
-grep -m1 "Started Application" ~/autodl-tmp/fhir/server.log
-```
-
-`setsid` matters: without it the server dies with the shell that launched it.
-
-### If no registry is reachable
-
-`--check` reporting nothing means egress filtering, not a bad mirror. Pull on any machine
-with working Docker Hub access and copy `~/fhir/rootfs` and `~/fhir/run.sh` across — that
-tree is self-contained apart from the absolute paths baked into `run.sh`, which you fix by
-re-running the fetch with `--offline` on the target, or by editing `ROOTFS=` at its top.
-
-## 4. Model server
-
-```bash
-source /etc/network_turbo                     # AutoDL: ON for HuggingFace
-export HF_HOME=/root/autodl-tmp/hf            # ~16 GB; keep off the system disk
-export HF_HUB_DISABLE_XET=1                   # Xet CAS bypasses mirrors and 401s
-export HF_ENDPOINT=https://hf-mirror.com      # only if HF itself is slow
-
-hf download Qwen/Qwen3-8B
-```
-
-```bash
-export HF_HOME=/root/autodl-tmp/hf
-export HF_HUB_OFFLINE=1                       # resolve from cache; fail fast, never hang
-export VLLM_USE_FLASHINFER_SAMPLER=0          # FlashInfer's arch check breaks on sm120
+pip install vllm
 
 vllm serve Qwen/Qwen3-8B --served-model-name Qwen3-8B \
   --dtype bfloat16 --max-model-len 8192 \
@@ -130,35 +94,29 @@ vllm serve Qwen/Qwen3-8B --served-model-name Qwen3-8B \
   --gpu-memory-utilization 0.90
 ```
 
-`--enable-prefix-caching` because k resampled actions at a turn share a long identical
+`--enable-prefix-caching` because the k resampled actions at a turn share a long identical
 prompt — without it the prefill is recomputed k times. `--no-enable-chunked-prefill`
-because hidden-state extraction requires it later, and G2's throughput numbers should
-match the config real sweeps use.
+because hidden-state extraction needs it later, and G2's throughput should be measured
+under the configuration real sweeps use.
 
-## 5. Gate G0
+## 6. Gate G0
 
 ```bash
 .venv/bin/python scripts/g0_environment.py \
-    --fhir http://localhost:8080/fhir \
-    --base-url http://localhost:8000/v1 \
+    --fhir http://localhost:8080/fhir --base-url http://localhost:8000/v1 \
     --determinism-trials 8 --out results/g0.json
 ```
 
-Want `[PASS]` with:
+Checks the server is populated (not merely up), that logprobs come back, and measures
+**logprob determinism**: vLLM is not bitwise deterministic across batch compositions, so
+identical temperature-0 requests can drift, which would be a noise floor under every
+estimator. Measured at exactly `0.000e+00` on an RTX 5090 — re-measure per GPU, and again
+under concurrent load, since client-side repetition does not control batch composition.
 
-```
-Patient 695 · Observation 563426 · MedicationRequest 21991 · Procedure 124969 · Condition 74821
-```
-
-Different counts mean the extraction is incomplete. The determinism block measures
-logprob drift across identical temperature-0 requests — it was exactly `0.000e+00` on an
-RTX 5090, so there is no nondeterminism noise floor under the estimators. Re-measure if
-the serving config changes.
-
-## 6. Gate G2
+## 7. Gate G2 — model gate
 
 ```bash
-# harness check: no GPU, ~1 min, catches config errors before spending GPU time
+# harness check first: no GPU, ~1 min
 .venv/bin/python scripts/g2_model_gate.py --tasks data/test_data_v2.json \
     --backend stub --per-template 1 --out runs/g2_smoke
 
@@ -166,12 +124,12 @@ the serving config changes.
 .venv/bin/python scripts/g2_model_gate.py --tasks data/test_data_v2.json \
     --backend vllm --base-url http://localhost:8000/v1 \
     --fhir http://localhost:8080/fhir --refsol data/refsol.py \
-    --per-template 5 --concurrency 2 --out runs/g2_qwen3-8b_nothink
+    --per-template 5 --concurrency 2 --out runs/g2_nothink
 
 .venv/bin/python scripts/g2_model_gate.py --tasks data/test_data_v2.json \
     --backend vllm --base-url http://localhost:8000/v1 \
     --fhir http://localhost:8080/fhir --refsol data/refsol.py \
-    --per-template 5 --concurrency 2 --strip-think --out runs/g2_qwen3-8b_think
+    --per-template 5 --concurrency 2 --strip-think --out runs/g2_think
 ```
 
 **Passes at action SR ≥ 40% and schema-valid ≥ 80%**, read off the *action* column — two
@@ -179,16 +137,15 @@ published open-weight models score 0.00% on action tasks while scoring 8–39% o
 tasks, and an all-negative label set makes AUROC undefined at exactly the turns the thesis
 is about.
 
-Both tiers are run because Qwen3 emits `<think>` blocks by default, which our prefix
-dispatch classifies as INVALID. `--strip-think` fixes that but is a **scaffold change**,
-not a parity fix — scaffold quality alone moves success on this benchmark by more than 20
-points, so the delta has to be measured rather than folded in silently.
+Both tiers are run because Qwen3 emits `<think>` blocks that our prefix dispatch
+classifies as INVALID. `--strip-think` fixes that but is a **scaffold change**, not a
+parity fix: scaffold quality alone moves success on this benchmark by more than 20 points,
+so the delta is measured rather than folded in silently.
 
-Repeat per candidate model, restarting `vllm serve` between each. Then pick three spanning
-action SR at roughly 25 / 45 / 65% and re-run the shortlist on the full 300 (drop
-`--per-template`).
+Then pick three models spanning action SR at roughly 25 / 45 / 65% and re-run the
+shortlist on the full 300 (drop `--per-template`).
 
-## 7. First sweep
+## 8. First sweep
 
 ```bash
 .venv/bin/python scripts/run_agent.py --tasks data/test_data_v2.json \
@@ -199,25 +156,41 @@ action SR at roughly 25 / 45 / 65% and re-run the shortlist on the full 300 (dro
 
 Immutable run directory with a manifest (git SHA, dirty flag, config hash, library
 versions), `trajectories.jsonl` and `run_stats.json`. `--resume <run_dir>` skips tasks
-already logged, so a sweep dying at task 250 does not cost 250 tasks of GPU time.
+already logged, so a sweep dying at task 250 does not cost 250 tasks of GPU time — which
+matters on Colab, where sessions cap at ~12 hours.
 
-Check `run_stats.json` from a `--per-template 2` trial first and extrapolate — it is the
+Run a `--per-template 2` trial first and extrapolate from its `run_stats.json`: it is the
 first real datapoint against the proposal's unvalidated 15.6 GPU-hours-per-sweep estimate.
 
 ---
 
-## Known breakages and their fixes
+## Appendix — other targets
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `dockerd`: iptables permission denied | `cap_sys_admin` dropped in the container | Don't use Docker; §3 |
-| `udocker`: `do not run as root` | udocker refuses uid 0 | `udocker --allow-root`, or an unprivileged user |
-| Registry 403 that worked a minute ago | network_turbo proxy | `unset http_proxy …` |
-| `git pull`: GnuTLS recv error | turbo is OFF and GitHub needs it | `source /etc/network_turbo` |
-| Blob 404 from a mirror | pull-through cache never warmed | Resolve the manifest from the same registry — the script now always does |
-| Download hangs on the first blob | urllib timeout is per read, not total | Fixed: stalls below 20 kB/s are abandoned |
-| `hf download`: CAS 401 from xethub | Xet backend bypasses mirrors | `export HF_HUB_DISABLE_XET=1` |
-| vLLM: FlashInfer requires sm75+ | arch detection fails on sm120 | `export VLLM_USE_FLASHINFER_SAMPLER=0` |
-| vLLM: `Repo id must be in the form…` | a local path that does not exist | Serve by repo id with `HF_HOME` set |
-| FHIR server dies when the shell exits | not detached | `setsid nohup … < /dev/null &` |
-| G2 action SR ≈ 0, invalid-action ≈ 100% | model emits `<think>` | `--strip-think`, and report it as a scaffold tier |
+### Colab, non-A100
+
+`gpu_profile.py` will say so, but in short: a **T4 is compute capability 7.5 and has no
+bfloat16**, and an 8B model in 16-bit does not fit its 16 GB. It caps out around
+Qwen3-1.7B in float16, which will very likely fail G2 — that is the gate working. Note
+also that a float16 run is **not directly comparable** to the bf16 runs the proposal
+specifies (§6.6), because logits are the measurement instrument. An L4 gets bf16 and
+about Qwen3-4B.
+
+### Colab session limits
+
+Sessions disconnect after ~90 minutes idle and cap at ~12 hours. Copy `results/` and
+`runs/` to Drive before the runtime dies; `--resume` handles the rest.
+
+### Hosts where Docker Hub is blocked
+
+Use `--check --try-mirrors` to find a working registry. On AutoDL specifically, the
+`network_turbo` accelerator is a proxy that must be **ON for GitHub and HuggingFace** and
+**OFF for container registries** — they are mutually exclusive, and having it the wrong
+way round produces confusing 403s. Also `export VLLM_USE_FLASHINFER_SAMPLER=0` on RTX 5090
+(sm120), where FlashInfer's arch check fails, and `export HF_HUB_DISABLE_XET=1` where
+HuggingFace's Xet backend bypasses mirrors and 401s.
+
+### If no registry is reachable at all
+
+Pull on any machine with Docker Hub access and copy `~/fhir/rootfs` plus `~/fhir/run.sh`
+across. The tree is self-contained apart from the absolute paths in `run.sh`; fix those by
+re-running the fetch with `--offline` on the target, or by editing `ROOTFS=` at its top.
