@@ -29,6 +29,7 @@ def resample_turn(
     k: int,
     temperature: float = 1.0,
     capture_logprobs: bool = True,
+    strip_think: bool = False,
 ) -> list[Sample]:
     """Draw k alternative actions for the same history.
 
@@ -40,7 +41,7 @@ def resample_turn(
         generation = backend.generate(
             messages, capture_logprobs=capture_logprobs, temperature=temperature
         )
-        action = parse(generation.text)
+        action = parse(generation.text, strip_think=strip_think)
         samples.append(
             Sample(
                 index=index,

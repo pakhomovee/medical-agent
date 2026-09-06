@@ -48,6 +48,7 @@ def run_episode(
     capture_logprobs: bool = True,
     n_samples: int = 0,
     sample_temperature: float = 1.0,
+    strip_think: bool = False,
     seed: int | None = None,
     run_id: str | None = None,
 ) -> Trajectory:
@@ -81,11 +82,11 @@ def run_episode(
                 trajectory.status = STATUS_CONTEXT_LIMIT
                 break
 
-            action = parse(generation.text)
+            action = parse(generation.text, strip_think=strip_think)
             samples = (
                 resample_turn(
                     history, backend, k=n_samples, temperature=sample_temperature,
-                    capture_logprobs=capture_logprobs,
+                    capture_logprobs=capture_logprobs, strip_think=strip_think,
                 )
                 if n_samples > 0
                 else []

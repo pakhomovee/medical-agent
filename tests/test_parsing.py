@@ -68,3 +68,54 @@ def test_finish_is_terminal_and_get_is_not():
 def test_parse_finish_list_returns_none_for_unparseable():
     assert parse_finish_list("not json at all") is None
     assert parse_finish_list(None) is None
+
+
+# --- reasoning models -----------------------------------------------------------------
+# Qwen3 emits <think> blocks by default, so a response begins '<think>' and the prefix
+# dispatch classifies every turn INVALID -- action SR would read 0% for a pure format
+# reason. Stripping is a SCAFFOLD CHANGE (plan §8), hence opt-in and off by default.
+
+THINKING = '<think>\nThe user wants a magnesium level. I should query Observation.\n</think>\nGET http://x/fhir/Observation?code=MG'
+
+
+def test_reasoning_block_makes_the_turn_invalid_by_default():
+    assert parse(THINKING).kind is ActionKind.INVALID
+
+
+def test_stripping_recovers_the_action():
+    action = parse(THINKING, strip_think=True)
+    assert action.kind is ActionKind.GET
+    assert action.url == "http://x/fhir/Observation?code=MG&_format=json"
+
+
+def test_stripping_handles_a_post_with_its_payload_intact():
+    text = '<think>dose is 10</think>\nPOST http://x/fhir/MedicationRequest\n{"resourceType": "MedicationRequest"}'
+    action = parse(text, strip_think=True)
+    assert action.kind is ActionKind.POST
+    assert json.loads(action.post_body)["resourceType"] == "MedicationRequest"
+
+
+def test_thinking_tag_variant_is_handled():
+    assert parse("<thinking>hm</thinking>\nFINISH([1])", strip_think=True).kind is ActionKind.FINISH
+
+
+def test_multiple_blocks_are_all_removed():
+    text = "<think>a</think>\n<think>b</think>\nFINISH([2])"
+    assert parse(text, strip_think=True).finish_payload == "[2]"
+
+
+def test_unclosed_block_stays_invalid():
+    """Truncated mid-thought (hit max_tokens) is a failed turn, not a recoverable one."""
+    assert parse("<think>still reasoning and ran out of tok", strip_think=True).kind is ActionKind.INVALID
+
+
+def test_stripping_is_a_noop_on_a_plain_action():
+    assert parse("GET http://x?a=1", strip_think=True).url == parse("GET http://x?a=1").url
+
+
+def test_stripping_does_not_touch_think_inside_a_payload():
+    # A literal '<think>' in free text must survive: only well-formed blocks are removed.
+    payload = {"resourceType": "ServiceRequest", "note": {"text": "patient did not think clearly"}}
+    text = f'POST http://x/fhir/ServiceRequest\n{json.dumps(payload)}'
+    action = parse(text, strip_think=True)
+    assert json.loads(action.post_body)["note"]["text"] == "patient did not think clearly"

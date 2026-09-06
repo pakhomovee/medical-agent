@@ -273,6 +273,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default="")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--strip-think", action="store_true",
+                        help="strip <think> blocks before dispatch (reasoning models). "
+                             "SCAFFOLD CHANGE -- record it as a named tier, see plan §8")
     parser.add_argument("--max-round", type=int, default=5,
                         help="upstream default is 5; the proposal says 8 (Spike A resolves)")
     parser.add_argument("--per-template", type=int, default=None)
@@ -319,7 +322,8 @@ def main(argv: list[str] | None = None) -> int:
 
     def run_one(task: T.Task) -> tuple[dict, dict]:
         episode = run_episode(
-            task, backend, fhir, functions, max_round=args.max_round, capture_logprobs=True
+            task, backend, fhir, functions, max_round=args.max_round,
+            capture_logprobs=True, strip_think=args.strip_think,
         )
         correct = grade_task(
             grader,

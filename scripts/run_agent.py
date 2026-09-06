@@ -88,6 +88,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--n-samples", type=int, default=0,
                         help="k alternatives per turn, history pinned (0 disables)")
     parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--strip-think", action="store_true",
+                        help="strip <think> blocks before dispatch (reasoning models). "
+                             "SCAFFOLD CHANGE -- record it as a named tier, see plan §8")
     parser.add_argument("--max-round", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--per-template", type=int, default=None)
@@ -128,6 +131,7 @@ def main(argv: list[str] | None = None) -> int:
         "temperature": args.temperature,
         "sample_temperature": args.sample_temperature,
         "n_samples": args.n_samples,
+        "strip_think": args.strip_think,
         "max_round": args.max_round,
         "max_tokens": args.max_tokens,
         "seed": args.seed,
@@ -161,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
             capture_logprobs=True,
             n_samples=args.n_samples,
             sample_temperature=args.sample_temperature,
+            strip_think=args.strip_think,
             seed=args.seed,
             run_id=manifest.run_id,
         )

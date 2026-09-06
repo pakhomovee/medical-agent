@@ -20,6 +20,7 @@ outcomes and a "fix" would register as a parity failure:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from enum import Enum
 
@@ -44,13 +45,42 @@ class Action:
         return self.kind in (ActionKind.FINISH, ActionKind.INVALID)
 
 
-def clean(content: str) -> str:
+# Reasoning models (Qwen3, DeepSeek-R1 and friends) wrap chain-of-thought in these.
+# Upstream never met one, so it has no handling -- see strip_reasoning below.
+_THINK = re.compile(r"<(think|thinking)>.*?</\1>", re.DOTALL | re.IGNORECASE)
+_UNCLOSED_THINK = re.compile(r"^\s*<(think|thinking)>.*", re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning(content: str) -> str:
+    """Remove <think> blocks before dispatching on the action prefix.
+
+    Qwen3 emits reasoning by default, so a response begins ``<think>...`` and the
+    prefix dispatch below would classify every turn as INVALID -- action success would
+    read 0% for a pure format reason, which is exactly the format-versus-clinical
+    confound of plan §4.4.
+
+    This is a SCAFFOLD CHANGE, not a parity fix: upstream has no such handling because
+    it predates reasoning models. It is therefore off by default and must be switched on
+    explicitly as a named tier (plan §8 open decision 2), so that any effect on success
+    rate is attributable rather than silent.
+
+    An unclosed block (the model hit max_tokens mid-thought) leaves nothing to dispatch
+    on, which correctly parses as INVALID -- a truncated turn is a failed turn.
+    """
+    without_blocks = _THINK.sub("", content).strip()
+    if without_blocks:
+        return without_blocks
+    return "" if _UNCLOSED_THINK.match(content) else content.strip()
+
+
+def clean(content: str, strip_think: bool = False) -> str:
     """Upstream's normalisation, including the Gemini-2.0-Flash fence stripping."""
-    return content.strip().replace("```tool_code", "").replace("```", "").strip()
+    text = strip_reasoning(content) if strip_think else content
+    return text.strip().replace("```tool_code", "").replace("```", "").strip()
 
 
-def parse(content: str) -> Action:
-    text = clean(content)
+def parse(content: str, strip_think: bool = False) -> Action:
+    text = clean(content, strip_think=strip_think)
 
     if text.startswith("GET"):
         return Action(kind=ActionKind.GET, raw=text, url=text[3:].strip() + "&_format=json")
