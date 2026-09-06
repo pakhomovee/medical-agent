@@ -256,6 +256,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="registry base URL; use a mirror if Docker Hub is blocked")
     parser.add_argument("--repo", default=DEFAULT_REPO)
     parser.add_argument("--tag", default=DEFAULT_TAG)
+    parser.add_argument("--manifest", type=Path, default=None,
+                        help="use this manifest instead of resolving one from a registry; "
+                             "data/medagentbench_image_manifest.json pins the exact image")
+    parser.add_argument("--offline", action="store_true",
+                        help="extract from already-downloaded blobs; never touch a registry")
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--heap", default="2g", help="JVM max heap, e.g. 2g")
@@ -271,32 +276,61 @@ def main(argv: list[str] | None = None) -> int:
     registry = args.registry.rstrip("/")
     print(f"registry: {registry}\nrepo:     {args.repo}:{args.tag}\nout:      {out}\n")
 
-    print("resolving manifest...")
-    try:
-        manifest = fetch_manifest(registry, args.repo, args.tag, args.timeout)
-    except (urllib.error.URLError, TimeoutError, RuntimeError, ValueError) as exc:
-        print(f"\nFAILED to fetch the manifest: {exc}\n", file=sys.stderr)
-        print("Most likely the registry is unreachable from this network. Try:", file=sys.stderr)
-        print("  source /etc/network_turbo            # on AutoDL", file=sys.stderr)
-        print("  --registry https://docker.m.daocloud.io", file=sys.stderr)
+    cached_manifest = blobs / "manifest.json"
+    manifest_source = args.manifest or (cached_manifest if args.offline else None)
+
+    if manifest_source and manifest_source.exists():
+        print(f"using manifest {manifest_source}")
+        manifest = json.loads(manifest_source.read_text(encoding="utf-8"))
+    elif args.offline:
+        print(f"\n--offline needs a manifest: none at {cached_manifest}. Pass --manifest "
+              "data/medagentbench_image_manifest.json\n", file=sys.stderr)
         return 2
+    else:
+        print("resolving manifest...")
+        try:
+            manifest = fetch_manifest(registry, args.repo, args.tag, args.timeout)
+        except (urllib.error.URLError, TimeoutError, RuntimeError, ValueError) as exc:
+            print(f"\nFAILED to fetch the manifest: {exc}\n", file=sys.stderr)
+            print("Options:", file=sys.stderr)
+            print("  --manifest data/medagentbench_image_manifest.json   # pinned, no lookup",
+                  file=sys.stderr)
+            print("  --offline                     # extract from blobs already downloaded",
+                  file=sys.stderr)
+            print("  --registry https://docker.m.daocloud.io", file=sys.stderr)
+            print("  turn AutoDL network_turbo OFF for mirrors, ON for HuggingFace",
+                  file=sys.stderr)
+            return 2
+        cached_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     layers = manifest["layers"]
     total = sum(layer["size"] for layer in layers)
     print(f"  {len(layers)} layers, {total/1e9:.2f} GB compressed\n")
 
-    print("downloading config...")
-    config = json.loads(
-        download_blob(registry, args.repo, manifest["config"]["digest"],
-                      blobs / "config.json", args.timeout).read_text(encoding="utf-8")
-    )
+    if args.offline:
+        missing = [l["digest"] for l in layers
+                   if not (blobs / l["digest"].replace(":", "_")).exists()]
+        if missing or not (blobs / "config.json").exists():
+            print(f"\n--offline but {len(missing)} layer(s) are not cached in {blobs}.\n"
+                  "Re-run online once to fetch them; cached layers are digest-verified and "
+                  "skipped.\n", file=sys.stderr)
+            return 2
+        print("offline: using cached blobs")
+        config = json.loads((blobs / "config.json").read_text(encoding="utf-8"))
+        paths = [blobs / l["digest"].replace(":", "_") for l in layers]
+    else:
+        print("downloading config...")
+        config = json.loads(
+            download_blob(registry, args.repo, manifest["config"]["digest"],
+                          blobs / "config.json", args.timeout).read_text(encoding="utf-8")
+        )
 
-    print("downloading layers...")
-    paths = []
-    for layer in layers:
-        paths.append(download_blob(registry, args.repo, layer["digest"],
-                                   blobs / layer["digest"].replace(":", "_"),
-                                   args.timeout))
+        print("downloading layers...")
+        paths = []
+        for layer in layers:
+            paths.append(download_blob(registry, args.repo, layer["digest"],
+                                       blobs / layer["digest"].replace(":", "_"),
+                                       args.timeout))
 
     print("\nextracting...")
     extract_layers(paths, rootfs)
@@ -311,7 +345,7 @@ def main(argv: list[str] | None = None) -> int:
 
     script = write_launcher(rootfs, out, config, args.port, args.heap)
 
-    if not args.keep_blobs:
+    if not args.keep_blobs and not args.offline:
         shutil.rmtree(blobs, ignore_errors=True)
         print(f"  removed layer cache (pass --keep-blobs to retain)")
 
