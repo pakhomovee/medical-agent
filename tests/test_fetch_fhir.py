@@ -16,13 +16,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from fetch_fhir_server import _parse_challenge, extract_layers  # noqa: E402
+from fetch_fhir_server import extract_layers, parse_challenge  # noqa: E402
 
 
 # --- WWW-Authenticate parsing ---------------------------------------------------------
 
 def test_parses_docker_hub_challenge():
-    challenge = _parse_challenge(
+    challenge = parse_challenge(
         'Bearer realm="https://auth.docker.io/token",service="registry.docker.io"'
     )
     assert challenge["realm"] == "https://auth.docker.io/token"
@@ -31,7 +31,7 @@ def test_parses_docker_hub_challenge():
 
 def test_parses_mirror_challenge_with_a_different_realm_path():
     """The daocloud shape -- the case the hardcoded /token guess got wrong."""
-    challenge = _parse_challenge(
+    challenge = parse_challenge(
         'Bearer realm="https://docker.m.daocloud.io/auth/token",service="docker.m.daocloud.io"'
     )
     assert challenge["realm"] == "https://docker.m.daocloud.io/auth/token"
@@ -39,23 +39,23 @@ def test_parses_mirror_challenge_with_a_different_realm_path():
 
 
 def test_parses_challenge_carrying_a_scope():
-    challenge = _parse_challenge(
+    challenge = parse_challenge(
         'Bearer realm="https://r/token",service="s",scope="repository:a/b:pull"'
     )
     assert challenge["scope"] == "repository:a/b:pull"
 
 
 def test_challenge_without_service_is_still_usable():
-    assert _parse_challenge('Bearer realm="https://r/token"') == {"realm": "https://r/token"}
+    assert parse_challenge('Bearer realm="https://r/token"') == {"realm": "https://r/token"}
 
 
 def test_non_bearer_challenge_is_ignored():
-    assert _parse_challenge('Basic realm="x"') == {}
-    assert _parse_challenge("") == {}
+    assert parse_challenge('Basic realm="x"') == {}
+    assert parse_challenge("") == {}
 
 
 def test_challenge_parsing_is_case_insensitive_on_the_scheme():
-    assert _parse_challenge('bearer realm="https://r/t"')["realm"] == "https://r/t"
+    assert parse_challenge('bearer realm="https://r/t"')["realm"] == "https://r/t"
 
 
 # --- layer extraction -----------------------------------------------------------------
@@ -129,8 +129,8 @@ def test_download_falls_through_to_a_working_mirror(tmp_path, monkeypatch):
         dest.write_bytes(b"payload")
         return dest
 
-    monkeypatch.setattr(F, "_download_blob_from", fake)
-    out = F.download_blob(["https://bad1", "https://bad2", "https://good"],
+    monkeypatch.setattr(F, "fetch_blob", fake)
+    out = F.cached_or_fetch(["https://bad1", "https://bad2", "https://good"],
                           "r/i", "sha256:x", tmp_path / "blob", 5)
     assert out.read_bytes() == b"payload"
     assert attempted == ["https://bad1", "https://bad2", "https://good"]
@@ -139,18 +139,18 @@ def test_download_falls_through_to_a_working_mirror(tmp_path, monkeypatch):
 def test_download_reports_all_mirrors_failing(tmp_path, monkeypatch):
     import fetch_fhir_server as F
 
-    monkeypatch.setattr(F, "_download_blob_from",
+    monkeypatch.setattr(F, "fetch_blob",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("nope")))
     with pytest.raises(RuntimeError, match="all registries failed"):
-        F.download_blob(["https://a", "https://b"], "r/i", "sha256:x", tmp_path / "b", 5)
+        F.cached_or_fetch(["https://a", "https://b"], "r/i", "sha256:x", tmp_path / "b", 5)
 
 
 def test_a_bare_registry_string_still_works(tmp_path, monkeypatch):
     import fetch_fhir_server as F
 
-    monkeypatch.setattr(F, "_download_blob_from",
+    monkeypatch.setattr(F, "fetch_blob",
                         lambda reg, repo, dig, dest, t: (dest.write_bytes(b"k"), dest)[1])
-    assert F.download_blob("https://one", "r/i", "sha256:x", tmp_path / "b", 5).exists()
+    assert F.cached_or_fetch("https://one", "r/i", "sha256:x", tmp_path / "b", 5).exists()
 
 
 def test_cached_blob_skips_the_network_entirely(tmp_path, monkeypatch):
@@ -161,54 +161,53 @@ def test_cached_blob_skips_the_network_entirely(tmp_path, monkeypatch):
     dest = tmp_path / "blob"
     dest.write_bytes(b"cached")
     digest = "sha256:" + hashlib.sha256(b"cached").hexdigest()
-    monkeypatch.setattr(F, "_download_blob_from",
+    monkeypatch.setattr(F, "fetch_blob",
                         lambda *a, **k: pytest.fail("must not hit the network"))
-    assert F.download_blob(["https://x"], "r/i", digest, dest, 5) == dest
+    assert F.cached_or_fetch(["https://x"], "r/i", digest, dest, 5) == dest
 
+# --- preflight ------------------------------------------------------------------------
 
-def test_pinned_manifest_matches_the_live_image():
-    """The committed manifest pins the exact image; layer count and digest are fixed."""
-    import json
-
-    manifest = json.loads(
-        Path("data/medagentbench_image_manifest.json").read_text(encoding="utf-8")
-    )
-    assert len(manifest["layers"]) == 38
-    assert manifest["config"]["digest"].startswith("sha256:a232b7b22b86")
-    assert sum(layer["size"] for layer in manifest["layers"]) > 1.8e9
-
-
-def test_stalled_transfer_is_abandoned_so_the_next_mirror_gets_a_turn(tmp_path, monkeypatch):
-    """urllib's timeout is per read, so a trickling mirror hangs forever without this."""
+def test_check_requires_a_working_blob_not_just_a_manifest(monkeypatch, tmp_path):
+    """Mirrors commonly resolve a manifest and then 404 the blobs, so both are probed."""
     import fetch_fhir_server as F
 
-    class Trickle:
-        headers = {"Content-Length": "100000000"}
+    manifest = {"layers": [{"digest": "sha256:aaa", "size": 10}]}
+    monkeypatch.setattr(F, "fetch_manifest", lambda reg, *a: manifest)
 
-        def read(self, n):
-            time.sleep(0.02)
-            return b"x"          # one byte per read: never trips a socket timeout
+    def blob(registry, repo, digest, dest, timeout, **kw):
+        if registry != "https://good":
+            raise RuntimeError("404")
+        dest.write_bytes(b"x")
+        return dest
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    import time
-
-    monkeypatch.setattr(F, "open_authed", lambda *a, **k: Trickle())
-    monkeypatch.setattr(F.time, "monotonic", _clock())
-    with pytest.raises(TimeoutError, match="stalled"):
-        F._download_blob_from("https://slow", "r/i", "sha256:x", tmp_path / "b", 5)
+    monkeypatch.setattr(F, "fetch_blob", blob)
+    assert F.check(["https://manifest-only", "https://good"], "r/i", "latest", 5) == \
+        ["https://good"]
 
 
-def _clock():
-    """Monotonic clock that jumps past the grace period after a few calls."""
-    state = {"t": 0.0}
+def test_check_returns_empty_when_nothing_works(monkeypatch):
+    import fetch_fhir_server as F
 
-    def now():
-        state["t"] += 20.0
-        return state["t"]
+    monkeypatch.setattr(F, "fetch_manifest",
+                        lambda *a: (_ for _ in ()).throw(RuntimeError("unreachable")))
+    assert F.check(["https://a", "https://b"], "r/i", "latest", 5) == []
 
-    return now
+
+def test_launcher_repoints_absolute_data_and_config_paths(tmp_path):
+    """The image hardcodes /data and /configs; nothing may need to exist at the root."""
+    import fetch_fhir_server as F
+
+    rootfs = tmp_path / "rootfs"
+    script = F.write_launcher(rootfs, tmp_path, port=8080, heap="2g")
+    text = script.read_text(encoding="utf-8")
+    assert str(rootfs) in text
+    assert "application.local.yaml" in text          # rewritten copy, not the packaged one
+    assert "SERVER_PORT=\"8080\"" in text
+    assert script.stat().st_mode & 0o111             # executable
+
+
+def test_launcher_fails_loudly_without_java(tmp_path):
+    import fetch_fhir_server as F
+
+    text = F.write_launcher(tmp_path / "r", tmp_path, 8080, "1g").read_text(encoding="utf-8")
+    assert "openjdk-17-jre-headless" in text

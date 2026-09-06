@@ -4,6 +4,9 @@ Instrumentation for the thesis described in
 `Turn-Level Uncertainty Quantification for Tool-Using Medical AI Agents — Thesis Proposal.md`.
 Execution plan: `~/.claude/plans/please-study-this-file-floating-dahl.md`.
 
+**Setting up a GPU box? Follow [RUNBOOK.md](RUNBOOK.md)** — every command in order, from
+a bare container to gate G2, with the known breakages and their fixes in one table.
+
 Current status: **stage 1 built; gates G0, G1, G2 implemented.** G1 has been run and passes.
 
 ## Why this is not a fork of MedAgentBench
@@ -78,9 +81,8 @@ plus a preloaded H2 database, so it runs on a bare JVM.
 ```bash
 apt-get install -y openjdk-17-jre-headless
 
-python scripts/fetch_fhir_server.py --out ~/fhir            # ~1.8 GB download
-# behind a blocked Docker Hub (verified against this mirror):
-python scripts/fetch_fhir_server.py --out ~/fhir --registry https://docker.m.daocloud.io
+python scripts/fetch_fhir_server.py --check                 # which registries work here?
+python scripts/fetch_fhir_server.py --out ~/fhir --registry <one it reported>
 
 ~/fhir/run.sh                                               # starts in ~70s
 ```

@@ -1,23 +1,33 @@
 #!/usr/bin/env python3
-"""Fetch and unpack the MedAgentBench FHIR server image without a Docker daemon.
+"""Fetch and unpack the MedAgentBench FHIR server, with no Docker daemon.
 
-Needed because container runtimes are unavailable in some environments (an AutoDL
-container drops ``cap_sys_admin``, so ``dockerd`` can never start) and because Docker Hub
-is unreachable from some networks. Neither is a real obstacle: the image is a Spring Boot
-HAPI FHIR war plus a preloaded H2 database, so it runs on a bare JVM.
+Two things make the obvious route unavailable in practice:
 
-    # default registry, straight from Docker Hub
-    python scripts/fetch_fhir_server.py --out ~/fhir
+* Container runtimes need privileges some GPU hosts do not grant. An AutoDL container
+  drops ``cap_sys_admin``, so ``dockerd`` can never start, whatever the user id.
+* Docker Hub is unreachable from some networks, and the public mirrors that proxy it are
+  region-dependent, rate-limited and individually unreliable.
 
-    # via a mirror, when Hub is blocked
-    python scripts/fetch_fhir_server.py --out ~/fhir \\
-        --registry https://docker.m.daocloud.io
+Neither actually matters, because the image is a Spring Boot HAPI FHIR war plus a
+preloaded H2 database. Pull the layers over plain HTTPS, unpack them, run it on a JVM.
 
-    # then, with openjdk-17-jre-headless installed
+    python scripts/fetch_fhir_server.py --check          # which registry works from here?
+    python scripts/fetch_fhir_server.py --out ~/fhir     # pull, unpack, write run.sh
     ~/fhir/run.sh
 
-Layers are cached by digest and verified against it, so an interrupted download resumes
-rather than restarting -- the image is ~1.8 GB compressed.
+Design notes, each of which is a bug this script previously had:
+
+* **Auth follows the WWW-Authenticate challenge.** Registries put their token endpoint in
+  different places -- Docker Hub at auth.docker.io, daocloud at /auth/token on its own
+  host. Guessing breaks on whichever one you did not test against.
+* **The manifest is always resolved from the registry the blobs come from.** Mirrors are
+  pull-through caches: they populate blobs only after a manifest request. Supplying a
+  pinned manifest to skip that lookup leaves the cache cold and every blob 404s.
+  A pinned manifest is therefore only meaningful for ``--offline``.
+* **Transfers are abandoned on stall.** urllib's timeout is per socket read, so a mirror
+  trickling bytes never trips it and the pull hangs forever.
+* **Blobs fall through to the next registry.** Digest verification makes mixing sources
+  safe, and a 1.8 GB pull should not die because one host is refusing today.
 """
 
 from __future__ import annotations
@@ -25,9 +35,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import shutil
-import subprocess
 import sys
 import tarfile
 import time
@@ -36,18 +44,17 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-DEFAULT_REPO = "jyxsu6/medagentbench"
-DEFAULT_TAG = "latest"
-DEFAULT_REGISTRY = "https://registry-1.docker.io"
+REPO = "jyxsu6/medagentbench"
+TAG = "latest"
 
-# Tried in order for each blob. Registries fail independently and intermittently -- a
-# mirror may 403 manifests but serve blobs, rate-limit after a partial pull, or simply be
-# unreachable from a given network -- so falling through beats failing the whole run.
-FALLBACK_REGISTRIES = [
+# Tried in order. Docker Hub first where reachable; the rest are public pull-through
+# mirrors whose availability varies by region -- hence --check.
+REGISTRIES = [
     "https://registry-1.docker.io",
     "https://docker.m.daocloud.io",
     "https://docker.1ms.run",
-    "https://hub.rat.dev",
+    "https://docker.xuanyuan.me",
+    "https://dockerhub.icu",
 ]
 
 ACCEPT = ",".join([
@@ -57,51 +64,33 @@ ACCEPT = ",".join([
     "application/vnd.oci.image.index.v1+json",
 ])
 
+MANIFEST_CACHE = "manifest.json"
 
-def _get(url: str, headers: dict, timeout: float = 60.0) -> bytes:
-    request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+
+# --- registry access ------------------------------------------------------------------
+
+def _read(url: str, headers: dict, timeout: float) -> bytes:
+    with urllib.request.urlopen(
+        urllib.request.Request(url, headers=headers), timeout=timeout
+    ) as response:
         return response.read()
 
 
-def _parse_challenge(header: str) -> dict:
-    """Parse a WWW-Authenticate Bearer challenge into its parameters.
-
-    ``Bearer realm="https://host/auth/token",service="host"`` -> {"realm": ..., "service": ...}
-    """
+def parse_challenge(header: str) -> dict:
+    """``Bearer realm="https://h/auth/token",service="h"`` -> {"realm":..., "service":...}"""
     if not header.lower().startswith("bearer"):
         return {}
-    params = {}
+    out = {}
     for part in header[len("bearer"):].strip().split(","):
         key, _, value = part.partition("=")
         if value:
-            params[key.strip()] = value.strip().strip('"')
-    return params
-
-
-def _token_for(challenge: dict, repo: str, timeout: float) -> str:
-    query = {"scope": f"repository:{repo}:pull"}
-    if challenge.get("service"):
-        query["service"] = challenge["service"]
-    body = json.loads(
-        _get(f"{challenge['realm']}?{urllib.parse.urlencode(query)}", {}, timeout)
-    )
-    token = body.get("token") or body.get("access_token")
-    if not token:
-        raise RuntimeError(f"no token in the response from {challenge['realm']}")
-    return token
+            out[key.strip()] = value.strip().strip('"')
+    return out
 
 
 def open_authed(url: str, repo: str, timeout: float, accept: str | None = None):
-    """Open a registry URL, following a 401 challenge if one comes back.
-
-    Registries put their token endpoint in different places -- Docker Hub uses
-    auth.docker.io, daocloud uses /auth/token on its own host -- and hardcoding either is
-    exactly why the first version of this failed against a mirror. The spec already says
-    where to look: the ``WWW-Authenticate`` header on the 401. Follow it and any mirror
-    works without special-casing.
-    """
-    headers = {"Accept": accept} if accept else {"Accept": "*/*"}
+    """Open a registry URL, following a 401 challenge to wherever it points."""
+    headers = {"Accept": accept or "*/*"}
     try:
         return urllib.request.urlopen(
             urllib.request.Request(url, headers=headers), timeout=timeout
@@ -109,21 +98,30 @@ def open_authed(url: str, repo: str, timeout: float, accept: str | None = None):
     except urllib.error.HTTPError as exc:
         if exc.code != 401:
             raise
-        challenge = _parse_challenge(exc.headers.get("WWW-Authenticate", ""))
+        challenge = parse_challenge(exc.headers.get("WWW-Authenticate", ""))
         if not challenge.get("realm"):
             raise
-    headers["Authorization"] = f"Bearer {_token_for(challenge, repo, timeout)}"
+
+    query = {"scope": f"repository:{repo}:pull"}
+    if challenge.get("service"):
+        query["service"] = challenge["service"]
+    body = json.loads(
+        _read(f"{challenge['realm']}?{urllib.parse.urlencode(query)}", {}, timeout)
+    )
+    token = body.get("token") or body.get("access_token")
+    if not token:
+        raise RuntimeError(f"no token from {challenge['realm']}")
+    headers["Authorization"] = f"Bearer {token}"
     return urllib.request.urlopen(
         urllib.request.Request(url, headers=headers), timeout=timeout
     )
 
 
 def fetch_manifest(registry: str, repo: str, tag: str, timeout: float) -> dict:
+    """Resolve the manifest. This also warms a pull-through mirror's blob cache."""
     with open_authed(f"{registry}/v2/{repo}/manifests/{tag}", repo, timeout, ACCEPT) as r:
         manifest = json.loads(r.read())
-
-    # Multi-arch index: pick linux/amd64.
-    if "manifests" in manifest:
+    if "manifests" in manifest:  # multi-arch index
         for entry in manifest["manifests"]:
             platform = entry.get("platform", {})
             if platform.get("os") == "linux" and platform.get("architecture") == "amd64":
@@ -132,74 +130,57 @@ def fetch_manifest(registry: str, repo: str, tag: str, timeout: float) -> dict:
     return manifest
 
 
-def download_blob(
-    registries: list[str] | str, repo: str, digest: str, dest: Path, timeout: float
-) -> Path:
-    """Download one blob, trying each registry in turn. Cached and digest-verified.
-
-    Registries fail independently and intermittently: a mirror may 403 manifests but
-    serve blobs, rate-limit after a partial pull, or be unreachable from one network and
-    fine from another. Falling through beats failing a 1.8 GB run on one bad host.
-    """
-    if isinstance(registries, str):
-        registries = [registries]
-    if dest.exists() and _sha256(dest) == digest.split(":", 1)[1]:
-        return dest
-
-    last = None
-    for index, registry in enumerate(registries):
-        try:
-            return _download_blob_from(registry, repo, digest, dest, timeout)
-        except Exception as exc:  # any transport or HTTP failure: try the next mirror
-            last = exc
-            remaining = len(registries) - index - 1
-            print(f"    {registry} failed ({type(exc).__name__}); {remaining} mirror(s) left")
-    raise RuntimeError(f"all registries failed for {digest}: {last}")
-
-
-def _download_blob_from(
+def fetch_blob(
     registry: str, repo: str, digest: str, dest: Path, timeout: float,
     min_bytes_per_s: float = 20_000.0,
 ) -> Path:
-    """Fetch one blob from one registry, abandoning a stalled transfer.
-
-    ``timeout`` is per socket read, not total, so a mirror trickling a few bytes every
-    interval never trips it and hangs indefinitely. A throughput floor catches that:
-    after a grace period, sustained rate below ``min_bytes_per_s`` raises so the caller
-    can try the next mirror.
-    """
+    """Fetch one blob from one registry, verifying its digest and abandoning stalls."""
     tmp = dest.with_suffix(".part")
     digester = hashlib.sha256()
-    opened = open_authed(f"{registry}/v2/{repo}/blobs/{digest}", repo, timeout)
     started = time.monotonic()
-    with opened as response, tmp.open("wb") as handle:
+
+    with open_authed(f"{registry}/v2/{repo}/blobs/{digest}", repo, timeout) as response, \
+            tmp.open("wb") as handle:
         total = int(response.headers.get("Content-Length") or 0)
         done = 0
         while chunk := response.read(1 << 20):
             handle.write(chunk)
             digester.update(chunk)
             done += len(chunk)
-            elapsed = time.monotonic() - started
+            elapsed = max(time.monotonic() - started, 1e-6)
             if elapsed > 30 and done / elapsed < min_bytes_per_s:
                 tmp.unlink(missing_ok=True)
-                raise TimeoutError(
-                    f"stalled at {done/1e6:.1f} MB ({done/elapsed/1e3:.1f} kB/s)"
-                )
+                raise TimeoutError(f"stalled at {done/1e6:.1f} MB ({done/elapsed/1e3:.1f} kB/s)")
             if total:
-                pct = done * 100 // total
-                eta = (total - done) / (done / elapsed) if done and elapsed else 0
-                print(f"\r    {digest[7:19]}  {done/1e6:7.1f}/{total/1e6:.1f} MB  {pct:3d}%  "
-                      f"{done/elapsed/1e6:.1f} MB/s  eta {eta/60:.0f}m   ",
+                rate = done / elapsed
+                eta = (total - done) / rate if rate else 0
+                print(f"\r    {digest[7:19]}  {done/1e6:7.1f}/{total/1e6:.1f} MB "
+                      f"{done*100//total:3d}%  {rate/1e6:4.1f} MB/s  eta {eta/60:3.0f}m",
                       end="", flush=True)
     print()
 
-    actual = digester.hexdigest()
-    expected = digest.split(":", 1)[1]
-    if actual != expected:
+    if digester.hexdigest() != digest.split(":", 1)[1]:
         tmp.unlink(missing_ok=True)
-        raise RuntimeError(f"digest mismatch for {digest}: got sha256:{actual}")
+        raise RuntimeError(f"digest mismatch for {digest}")
     tmp.rename(dest)
     return dest
+
+
+def cached_or_fetch(
+    registries: list[str], repo: str, digest: str, dest: Path, timeout: float
+) -> Path:
+    """Return a cached blob, else fetch from the first registry that serves it."""
+    if dest.exists() and _sha256(dest) == digest.split(":", 1)[1]:
+        return dest
+    last = None
+    for index, registry in enumerate(registries):
+        try:
+            return fetch_blob(registry, repo, digest, dest, timeout)
+        except Exception as exc:
+            last = exc
+            print(f"    {registry} failed ({type(exc).__name__}); "
+                  f"{len(registries) - index - 1} left")
+    raise RuntimeError(f"all registries failed for {digest}: {last}")
 
 
 def _sha256(path: Path) -> str:
@@ -210,11 +191,53 @@ def _sha256(path: Path) -> str:
     return digester.hexdigest()
 
 
-def extract_layers(layers: list[Path], rootfs: Path) -> None:
-    """Unpack layers in order, honouring whiteout markers.
+# --- preflight ------------------------------------------------------------------------
 
-    Layers are applied lowest-first; a ``.wh.<name>`` entry deletes ``<name>`` from the
-    accumulated filesystem, and ``.wh..wh..opq`` clears a directory's contents.
+def check(registries: list[str], repo: str, tag: str, timeout: float) -> list[str]:
+    """Report which registries serve both a manifest and a blob from here.
+
+    Exists so that diagnosing a blocked network is one command rather than a session of
+    ad-hoc curl. Manifest-only success is not enough: mirrors commonly resolve a manifest
+    and then 404 the blobs.
+    """
+    print(f"checking {len(registries)} registries for {repo}:{tag}\n")
+    working = []
+    for registry in registries:
+        print(f"  {registry}")
+        try:
+            manifest = fetch_manifest(registry, repo, tag, timeout)
+            print(f"    manifest OK ({len(manifest['layers'])} layers)")
+        except Exception as exc:
+            print(f"    manifest FAILED ({type(exc).__name__}: {exc})")
+            continue
+        smallest = min(manifest["layers"], key=lambda layer: layer["size"])
+        probe = Path(f"/tmp/.uqma_probe_{smallest['digest'][7:19]}")
+        try:
+            fetch_blob(registry, repo, smallest["digest"], probe, timeout)
+            print("    blob OK")
+            working.append(registry)
+        except Exception as exc:
+            print(f"    blob FAILED ({type(exc).__name__}: {exc})")
+        finally:
+            probe.unlink(missing_ok=True)
+
+    print()
+    if working:
+        print("USE:  --registry " + " --registry ".join(working))
+    else:
+        print("No registry works from this network. Options:\n"
+              "  - turn AutoDL network_turbo OFF (it proxies, and mirrors reject it)\n"
+              "  - pull on another machine and copy the extracted tree over\n"
+              "  - see RUNBOOK.md, section 'If no registry is reachable'")
+    return working
+
+
+# --- extraction -----------------------------------------------------------------------
+
+def extract_layers(layers: list[Path], rootfs: Path) -> None:
+    """Unpack lowest-first, honouring whiteouts.
+
+    ``.wh.<name>`` deletes ``<name>``; ``.wh..wh..opq`` clears a directory's contents.
     """
     rootfs.mkdir(parents=True, exist_ok=True)
     for index, layer in enumerate(layers, 1):
@@ -233,7 +256,7 @@ def extract_layers(layers: list[Path], rootfs: Path) -> None:
                     _remove(parent / name[4:])
                     continue
                 members.append(member)
-            _safe_extract(tar, members, rootfs)
+            _extract(tar, members, rootfs)
 
 
 def _remove(path: Path) -> None:
@@ -243,181 +266,155 @@ def _remove(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-def _safe_extract(tar: tarfile.TarFile, members: list, rootfs: Path) -> None:
-    """Extract, refusing paths that escape the destination."""
+def _extract(tar: tarfile.TarFile, members: list, rootfs: Path) -> None:
     root = rootfs.resolve()
     for member in members:
-        target = (rootfs / member.name).resolve()
-        if not str(target).startswith(str(root)):
+        if not str((rootfs / member.name).resolve()).startswith(str(root)):
             raise RuntimeError(f"refusing path traversal in layer: {member.name}")
         try:
             tar.extract(member, rootfs, filter="tar")
         except TypeError:  # Python < 3.12 has no filter=
             tar.extract(member, rootfs)
         except (OSError, tarfile.TarError):
-            continue  # device nodes and the like; irrelevant to a JVM app
+            continue  # device nodes and similar; irrelevant to a JVM app
 
 
-def write_launcher(rootfs: Path, out: Path, config: dict, port: int, heap: str) -> Path:
-    """Emit run.sh, translating the image ENTRYPOINT to run against the extracted tree.
+def write_launcher(rootfs: Path, out: Path, port: int, heap: str) -> Path:
+    """Emit run.sh from the image entrypoint, repointed at the extracted tree.
 
-    The image sets SPRING_CONFIG_LOCATION to an absolute /configs path and the H2 database
-    lives at an absolute /data path, so both are rewritten to point inside rootfs.
+    The packaged config puts the H2 database at an absolute ``/data`` path and
+    SPRING_CONFIG_LOCATION at ``/configs``; both are rewritten so nothing has to exist at
+    the filesystem root.
     """
-    entrypoint = (config.get("config") or {}).get("Entrypoint") or []
     script = out / "run.sh"
-    script.write_text(
-        f"""#!/usr/bin/env bash
-# Generated by scripts/fetch_fhir_server.py -- runs the MedAgentBench FHIR server
-# directly on a JVM, with no container runtime.
+    script.write_text(f"""#!/usr/bin/env bash
+# Generated by scripts/fetch_fhir_server.py -- MedAgentBench FHIR server on a bare JVM.
 set -euo pipefail
 ROOTFS="{rootfs}"
 cd "$ROOTFS/app"
 
-export SPRING_CONFIG_LOCATION="file://$ROOTFS/configs/application.yaml"
-export SERVER_PORT="{port}"
+JAVA="${{JAVA:-$(command -v java || echo /usr/lib/jvm/java-17-openjdk-amd64/bin/java)}}"
+if [ ! -x "$JAVA" ]; then
+  echo "java not found. apt-get install -y openjdk-17-jre-headless" >&2; exit 1
+fi
 
-# The packaged application.yaml points the H2 database at an absolute /data path.
-# Rewrite it to the extracted copy so no root-owned /data is needed.
 if [ ! -f "$ROOTFS/configs/application.local.yaml" ]; then
   sed "s#/data#$ROOTFS/data#g" "$ROOTFS/configs/application.yaml" \\
       > "$ROOTFS/configs/application.local.yaml"
 fi
 export SPRING_CONFIG_LOCATION="file://$ROOTFS/configs/application.local.yaml"
+export SERVER_PORT="{port}"
 
-exec java -Xmx{heap} \\
+exec "$JAVA" -Xmx{heap} \\
   --class-path "$ROOTFS/app/main.war" \\
   '-Dloader.path=main.war!/WEB-INF/classes/,main.war!/WEB-INF/,{rootfs}/app/extra-classes' \\
   org.springframework.boot.loader.PropertiesLauncher
-""",
-        encoding="utf-8",
-    )
+""", encoding="utf-8")
     script.chmod(0o755)
-    if entrypoint:
-        (out / "original_entrypoint.json").write_text(
-            json.dumps(entrypoint, indent=2), encoding="utf-8"
-        )
     return script
 
 
+# --- entry point ----------------------------------------------------------------------
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Fetch the MedAgentBench FHIR server image")
-    parser.add_argument("--out", type=Path, required=True, help="destination directory")
+    parser = argparse.ArgumentParser(description="Fetch the MedAgentBench FHIR server")
+    parser.add_argument("--out", type=Path, help="destination directory")
     parser.add_argument("--registry", action="append", default=None,
-                        help="registry base URL; repeat to set a fallback order. "
-                             "Defaults to Docker Hub plus several mirrors, each tried "
-                             "in turn per blob.")
-    parser.add_argument("--repo", default=DEFAULT_REPO)
-    parser.add_argument("--tag", default=DEFAULT_TAG)
-    parser.add_argument("--manifest", type=Path, default=None,
-                        help="use this manifest instead of resolving one from a registry; "
-                             "data/medagentbench_image_manifest.json pins the exact image")
+                        help="registry base URL; repeat to set fallback order")
+    parser.add_argument("--repo", default=REPO)
+    parser.add_argument("--tag", default=TAG)
+    parser.add_argument("--check", action="store_true",
+                        help="report which registries work from here, then exit")
     parser.add_argument("--offline", action="store_true",
-                        help="extract from already-downloaded blobs; never touch a registry")
-    parser.add_argument("--timeout", type=float, default=45.0,
-                        help="per-request timeout; a dead mirror is abandoned this fast")
+                        help="extract from cached blobs; never open a socket")
+    parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--heap", default="2g", help="JVM max heap, e.g. 2g")
+    parser.add_argument("--heap", default="2g")
     parser.add_argument("--keep-blobs", action="store_true",
-                        help="keep the layer cache (~1.8 GB) after extracting")
+                        help="retain the ~1.8 GB layer cache after extracting")
     args = parser.parse_args(argv)
 
+    registries = [r.rstrip("/") for r in (args.registry or REGISTRIES)]
+
+    if args.check:
+        return 0 if check(registries, args.repo, args.tag, args.timeout) else 1
+    if not args.out:
+        parser.error("--out is required unless --check is given")
+
     out = args.out.expanduser().resolve()
-    blobs = out / "blobs"
-    rootfs = out / "rootfs"
+    blobs, rootfs = out / "blobs", out / "rootfs"
     blobs.mkdir(parents=True, exist_ok=True)
-
-    registries = [r.rstrip("/") for r in (args.registry or FALLBACK_REGISTRIES)]
-    registry = registries[0]
-    print("registries:\n" + "\n".join(f"  {r}" for r in registries))
-    print(f"repo:     {args.repo}:{args.tag}\nout:      {out}\n")
-
-    cached_manifest = blobs / "manifest.json"
-    manifest_source = args.manifest or (cached_manifest if args.offline else None)
-
-    if manifest_source and manifest_source.exists():
-        print(f"using manifest {manifest_source}")
-        manifest = json.loads(manifest_source.read_text(encoding="utf-8"))
-    elif args.offline:
-        print(f"\n--offline needs a manifest: none at {cached_manifest}. Pass --manifest "
-              "data/medagentbench_image_manifest.json\n", file=sys.stderr)
-        return 2
-    else:
-        print("resolving manifest...")
-        manifest, exc = None, None
-        for candidate in registries:
-            try:
-                manifest = fetch_manifest(candidate, args.repo, args.tag, args.timeout)
-                print(f"  resolved via {candidate}")
-                break
-            except Exception as err:
-                exc = err
-                print(f"  {candidate} failed ({type(err).__name__})")
-        if manifest is None:
-            print(f"\nFAILED to fetch the manifest: {exc}\n", file=sys.stderr)
-            print("Options:", file=sys.stderr)
-            print("  --manifest data/medagentbench_image_manifest.json   # pinned, no lookup",
-                  file=sys.stderr)
-            print("  --offline                     # extract from blobs already downloaded",
-                  file=sys.stderr)
-            print("  --registry https://docker.m.daocloud.io", file=sys.stderr)
-            print("  turn AutoDL network_turbo OFF for mirrors, ON for HuggingFace",
-                  file=sys.stderr)
-            return 2
-        cached_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-
-    layers = manifest["layers"]
-    total = sum(layer["size"] for layer in layers)
-    print(f"  {len(layers)} layers, {total/1e9:.2f} GB compressed\n")
+    print(f"repo: {args.repo}:{args.tag}\nout:  {out}\n")
 
     if args.offline:
-        missing = [l["digest"] for l in layers
-                   if not (blobs / l["digest"].replace(":", "_")).exists()]
-        if missing or not (blobs / "config.json").exists():
-            print(f"\n--offline but {len(missing)} layer(s) are not cached in {blobs}.\n"
-                  "Re-run online once to fetch them; cached layers are digest-verified and "
-                  "skipped.\n", file=sys.stderr)
+        cached = blobs / MANIFEST_CACHE
+        if not cached.exists():
+            print(f"--offline needs a cached manifest at {cached}; run online once first",
+                  file=sys.stderr)
             return 2
-        print("offline: using cached blobs")
-        config = json.loads((blobs / "config.json").read_text(encoding="utf-8"))
-        paths = [blobs / l["digest"].replace(":", "_") for l in layers]
+        manifest = json.loads(cached.read_text(encoding="utf-8"))
+        print(f"offline: cached manifest, {len(manifest['layers'])} layers")
+        chosen: list[str] = []
     else:
-        print("downloading config...")
-        config = json.loads(
-            download_blob(registries, args.repo, manifest["config"]["digest"],
-                          blobs / "config.json", args.timeout).read_text(encoding="utf-8")
-        )
+        print("resolving manifest...")
+        manifest, chosen = None, []
+        for registry in registries:
+            try:
+                manifest = fetch_manifest(registry, args.repo, args.tag, args.timeout)
+                chosen = [registry] + [r for r in registries if r != registry]
+                print(f"  via {registry}: {len(manifest['layers'])} layers, "
+                      f"{sum(l['size'] for l in manifest['layers'])/1e9:.2f} GB")
+                break
+            except Exception as exc:
+                print(f"  {registry} failed ({type(exc).__name__})")
+        if manifest is None:
+            print("\nNo registry served a manifest. Run --check for a diagnosis, and see\n"
+                  "RUNBOOK.md. If AutoDL network_turbo is on, turn it OFF for registries.",
+                  file=sys.stderr)
+            return 2
+        (blobs / MANIFEST_CACHE).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-        print("downloading layers...")
-        paths = []
-        for layer in layers:
-            paths.append(download_blob(registries, args.repo, layer["digest"],
-                                       blobs / layer["digest"].replace(":", "_"),
-                                       args.timeout))
+    layers = manifest["layers"]
+
+    if args.offline:
+        missing = [l for l in layers if not (blobs / _blob_name(l["digest"])).exists()]
+        if missing:
+            print(f"--offline but {len(missing)} of {len(layers)} layers are not cached",
+                  file=sys.stderr)
+            return 2
+        paths = [blobs / _blob_name(l["digest"]) for l in layers]
+    else:
+        print("\ndownloading layers (cached ones are skipped)...")
+        paths = [
+            cached_or_fetch(chosen, args.repo, layer["digest"],
+                            blobs / _blob_name(layer["digest"]), args.timeout)
+            for layer in layers
+        ]
 
     print("\nextracting...")
     extract_layers(paths, rootfs)
 
-    war = rootfs / "app" / "main.war"
-    data = rootfs / "data"
+    war, data = rootfs / "app" / "main.war", rootfs / "data"
     print(f"\n  {'OK ' if war.exists() else 'MISSING'} {war}")
     print(f"  {'OK ' if data.is_dir() else 'MISSING'} {data}")
     if not war.exists():
-        print("\nmain.war not found -- the image layout changed; inspect rootfs/", file=sys.stderr)
+        print("\nmain.war absent; inspect rootfs/", file=sys.stderr)
         return 3
 
-    script = write_launcher(rootfs, out, config, args.port, args.heap)
-
+    script = write_launcher(rootfs, out, args.port, args.heap)
     if not args.keep_blobs and not args.offline:
         shutil.rmtree(blobs, ignore_errors=True)
-        print(f"  removed layer cache (pass --keep-blobs to retain)")
+        print("  layer cache removed (--keep-blobs to retain)")
 
-    java = shutil.which("java")
-    print(f"\nlauncher: {script}")
-    print(f"java:     {java or 'NOT FOUND -- apt-get install -y openjdk-17-jre-headless'}")
-    print(f"\nrun it:   {script}")
-    print(f"verify:   curl -s 'http://localhost:{args.port}/fhir/Patient?_count=1&_format=json'")
+    print(f"\nrun it:  {script}")
+    if not shutil.which("java"):
+        print("java:    NOT FOUND -- apt-get install -y openjdk-17-jre-headless")
+    print(f"verify:  curl -s 'http://localhost:{args.port}/fhir/Patient?_count=1&_format=json'")
     return 0
+
+
+def _blob_name(digest: str) -> str:
+    return digest.replace(":", "_")
 
 
 if __name__ == "__main__":
