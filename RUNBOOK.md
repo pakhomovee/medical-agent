@@ -73,7 +73,21 @@ It prints a ready-made `--registry` line. Use it:
 ```
 
 ~1.8 GB down, ~5 GB unpacked (the H2 database is 4.5 GB of it). Layers are cached and
-digest-verified, so an interrupted run resumes. Then:
+digest-verified, so an interrupted run resumes.
+
+**On trusting mirrors.** Digest verification alone only proves a blob matches the manifest
+that named it — and that manifest comes from the same registry as the blobs, so a hostile
+mirror could serve a poisoned manifest plus matching poisoned layers and every check would
+pass. `data/medagentbench_image_manifest.json` is pinned from Docker Hub and every
+resolved manifest is compared against it; a mismatch aborts before a byte is downloaded.
+That is what makes pulling through a third-party mirror safe. Refresh the pin only from
+Docker Hub (`--pin-manifest`), and never pass `--allow-manifest-drift` to work around a
+mismatch you have not explained.
+
+Consider running the server as an unprivileged user: it is a 326 MB WAR from a
+third-party image, and there is no reason for it to be root.
+
+Then:
 
 ```bash
 setsid nohup ~/autodl-tmp/fhir/run.sh > ~/autodl-tmp/fhir/server.log 2>&1 < /dev/null &

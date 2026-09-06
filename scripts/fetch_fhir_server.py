@@ -66,6 +66,15 @@ ACCEPT = ",".join([
 
 MANIFEST_CACHE = "manifest.json"
 
+# Trust anchor. Digest verification only proves a blob matches the manifest that named
+# it -- and that manifest comes from the same registry as the blobs, so a hostile mirror
+# could serve a poisoned manifest plus matching poisoned layers and every check would
+# pass. The pinned copy was captured from Docker Hub and is compared against whatever a
+# mirror returns, which is what actually makes pulling through a mirror safe. Refresh it
+# only from registry-1.docker.io:
+#     python scripts/fetch_fhir_server.py --pin-manifest
+PINNED_MANIFEST = Path(__file__).resolve().parents[1] / "data" / "medagentbench_image_manifest.json"
+
 
 # --- registry access ------------------------------------------------------------------
 
@@ -114,6 +123,35 @@ def open_authed(url: str, repo: str, timeout: float, accept: str | None = None):
     headers["Authorization"] = f"Bearer {token}"
     return urllib.request.urlopen(
         urllib.request.Request(url, headers=headers), timeout=timeout
+    )
+
+
+def manifest_identity(manifest: dict) -> tuple[str, frozenset]:
+    """The parts that determine what content will be executed."""
+    return manifest["config"]["digest"], frozenset(l["digest"] for l in manifest["layers"])
+
+
+def verify_against_pin(manifest: dict, pin_path: Path = PINNED_MANIFEST) -> None:
+    """Refuse a manifest whose content digests differ from the pinned copy.
+
+    Without this, pulling through a mirror trusts that mirror completely.
+    """
+    if not pin_path.exists():
+        print(f"    WARNING: no pinned manifest at {pin_path}; cannot verify the mirror")
+        return
+    pinned = json.loads(pin_path.read_text(encoding="utf-8"))
+    got, expected = manifest_identity(manifest), manifest_identity(pinned)
+    if got == expected:
+        print(f"    verified against pin ({pin_path.name})")
+        return
+    config_differs = got[0] != expected[0]
+    raise RuntimeError(
+        "MANIFEST DOES NOT MATCH THE PINNED COPY -- refusing to download.\n"
+        f"      config digest {'differs' if config_differs else 'matches'}; "
+        f"{len(got[1] ^ expected[1])} layer digest(s) differ.\n"
+        "      This registry is serving different content from Docker Hub. Do not use it.\n"
+        "      If the upstream image genuinely changed, re-pin from Docker Hub with "
+        "--pin-manifest and review the diff."
     )
 
 
@@ -209,6 +247,11 @@ def check(registries: list[str], repo: str, tag: str, timeout: float) -> list[st
             print(f"    manifest OK ({len(manifest['layers'])} layers)")
         except Exception as exc:
             print(f"    manifest FAILED ({type(exc).__name__}: {exc})")
+            continue
+        try:
+            verify_against_pin(manifest)
+        except RuntimeError as exc:
+            print(f"    UNSAFE: {exc}".splitlines()[0])
             continue
         smallest = min(manifest["layers"], key=lambda layer: layer["size"])
         probe = Path(f"/tmp/.uqma_probe_{smallest['digest'][7:19]}")
@@ -332,9 +375,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--heap", default="2g")
     parser.add_argument("--keep-blobs", action="store_true",
                         help="retain the ~1.8 GB layer cache after extracting")
+    parser.add_argument("--allow-manifest-drift", action="store_true",
+                        help="skip the pinned-manifest check. Only for a deliberate "
+                             "upstream image change -- it disables the protection that "
+                             "makes pulling through a mirror safe")
+    parser.add_argument("--pin-manifest", action="store_true",
+                        help="refresh data/medagentbench_image_manifest.json from Docker "
+                             "Hub (never from a mirror), then exit")
     args = parser.parse_args(argv)
 
     registries = [r.rstrip("/") for r in (args.registry or REGISTRIES)]
+
+    if args.pin_manifest:
+        manifest = fetch_manifest("https://registry-1.docker.io", args.repo, args.tag,
+                                  args.timeout)
+        PINNED_MANIFEST.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        print(f"pinned {len(manifest['layers'])} layers, config "
+              f"{manifest['config']['digest']}\n  -> {PINNED_MANIFEST}")
+        return 0
 
     if args.check:
         return 0 if check(registries, args.repo, args.tag, args.timeout) else 1
@@ -361,9 +419,11 @@ def main(argv: list[str] | None = None) -> int:
         for registry in registries:
             try:
                 manifest = fetch_manifest(registry, args.repo, args.tag, args.timeout)
-                chosen = [registry] + [r for r in registries if r != registry]
                 print(f"  via {registry}: {len(manifest['layers'])} layers, "
                       f"{sum(l['size'] for l in manifest['layers'])/1e9:.2f} GB")
+                if not args.allow_manifest_drift:
+                    verify_against_pin(manifest)
+                chosen = [registry] + [r for r in registries if r != registry]
                 break
             except Exception as exc:
                 print(f"  {registry} failed ({type(exc).__name__})")
