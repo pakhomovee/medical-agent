@@ -12,7 +12,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from g0_environment import check_determinism, check_fhir, check_model_server  # noqa: E402
+from g0_environment import (  # noqa: E402
+    _total,
+    check_determinism,
+    check_fhir,
+    check_model_server,
+)
 
 
 class FakeResponse:
@@ -164,3 +169,50 @@ def test_determinism_note_warns_about_batch_composition(monkeypatch):
     patch_session(monkeypatch, "g0", FakeModelSession([completion("A", [-0.1])] * 2))
     result = check_determinism("http://x/v1", "m", trials=2, timeout=1)
     assert "batch composition is not controlled" in result["note"]
+
+
+# --- FHIR content-type parity ---------------------------------------------------------
+
+def test_fhir_bodies_stay_text_because_hapi_sends_application_fhir_json(monkeypatch):
+    """PARITY-CRITICAL regression test.
+
+    HAPI answers with 'application/fhir+json', which does not contain the substring
+    'application/json', so the client leaves the body as text -- exactly as upstream's
+    send_get_request does. Parsing it would make the observation f-string render a Python
+    dict repr instead of JSON and silently change every prompt.
+    """
+    import requests
+
+    from uqma.envs.medagentbench.fhir import FhirClient
+
+    class FhirResponse:
+        status_code = 200
+        headers = {"content-type": "application/fhir+json;charset=UTF-8"}
+        text = '{"resourceType":"Bundle","total":695}'
+
+        def json(self):
+            raise AssertionError("must not parse: upstream feeds the model raw text")
+
+        def raise_for_status(self):
+            pass
+
+    class S:
+        headers = {}
+
+        def get(self, url, timeout=None):
+            return FhirResponse()
+
+    monkeypatch.setattr(requests, "Session", lambda: S())
+    result = FhirClient("http://x/fhir").get("http://x/fhir/Patient")
+    assert result.ok
+    assert isinstance(result.data, str)
+    assert result.data == '{"resourceType":"Bundle","total":695}'
+
+
+def test_g0_parses_the_count_out_of_that_text():
+    from uqma.envs.medagentbench.fhir import GetResult
+
+    assert _total(GetResult(ok=True, data='{"resourceType":"Bundle","total":695}')) == 695
+    assert _total(GetResult(ok=True, data={"total": 12})) == 12
+    assert _total(GetResult(ok=True, data="not json")) is None
+    assert _total(GetResult(ok=True, data='{"resourceType":"Bundle"}')) is None

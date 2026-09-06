@@ -324,7 +324,7 @@ def main(argv: list[str] | None = None) -> int:
         correct = grade_task(
             grader,
             raw[task.id],
-            GradingInput(result=episode.result, history=episode.history, status=episode.status),
+            GradingInput.from_trajectory(episode),
         )
         row = {
             "task_id": task.id,

@@ -86,6 +86,13 @@ class FhirClient:
         except requests.RequestException as exc:
             return GetResult(ok=False, error=str(exc))
 
+        # PARITY-CRITICAL. HAPI answers with 'application/fhir+json', which does NOT
+        # contain the substring 'application/json', so this branch is not taken and the
+        # body stays a *string*. Upstream's send_get_request has the identical check, so
+        # upstream also feeds the model raw JSON text. Parsing here would make the
+        # observation f-string render a Python dict repr (single quotes, True/False)
+        # instead of JSON, silently changing every prompt and breaking gate G4.
+        # Do not "fix" this. Callers that need structured data should json.loads it.
         content_type = response.headers.get("content-type", "")
         try:
             data = response.json() if "application/json" in content_type else response.text

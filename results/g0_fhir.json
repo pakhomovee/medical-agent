@@ -1,0 +1,29 @@
+{
+  "args": {
+    "fhir": "http://localhost:8080/fhir",
+    "base_url": "http://localhost:8000/v1",
+    "timeout": 60.0,
+    "determinism_trials": 8,
+    "skip_model": true,
+    "out": "results/g0_fhir.json"
+  },
+  "fhir": {
+    "ok": true,
+    "reachable": true,
+    "counts": {
+      "Patient": 695,
+      "Observation": 563426,
+      "MedicationRequest": 21991,
+      "Procedure": 124969,
+      "Condition": 74821
+    },
+    "note": null
+  },
+  "model_server": {
+    "ok": false,
+    "base_url": "http://localhost:8000/v1",
+    "error": "skipped"
+  },
+  "determinism": null,
+  "gate": "PASS"
+}

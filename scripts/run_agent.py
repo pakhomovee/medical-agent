@@ -166,8 +166,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         trajectory.correct = grade_task(
             grader, raw[task.id],
-            GradingInput(result=trajectory.result, history=trajectory.history,
-                         status=trajectory.status),
+            GradingInput.from_trajectory(trajectory),
         )
         return trajectory
 

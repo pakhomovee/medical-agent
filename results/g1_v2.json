@@ -92,18 +92,251 @@
       "consistent": true
     }
   },
-  "refsol": null,
+  "refsol": {
+    "file": "data/refsol.py",
+    "n_functions": 13,
+    "n_task_graders": 10,
+    "grader_names": [
+      "task1",
+      "task10",
+      "task2",
+      "task3",
+      "task4",
+      "task5",
+      "task6",
+      "task7",
+      "task8",
+      "task9"
+    ],
+    "per_category_not_per_task": true,
+    "field_level_graders": [
+      "task10",
+      "task3",
+      "task4",
+      "task5",
+      "task6",
+      "task7",
+      "task8",
+      "task9"
+    ],
+    "n_field_level": 8,
+    "history_reading_graders": [
+      "task1",
+      "task10",
+      "task2",
+      "task4",
+      "task5",
+      "task6",
+      "task7",
+      "task9"
+    ],
+    "n_history_reading": 8,
+    "graders": {
+      "task1": {
+        "n_lines": 10,
+        "args": [
+          "case_data",
+          "results",
+          "fhir_api_base"
+        ],
+        "field_markers": [],
+        "reads_history": true,
+        "queries_fhir": false
+      },
+      "task2": {
+        "n_lines": 15,
+        "args": [
+          "case_data",
+          "results",
+          "fhir_api_base"
+        ],
+        "field_markers": [],
+        "reads_history": true,
+        "queries_fhir": true
+      },
+      "task3": {
+        "n_lines": 23,
+        "args": [
+          "case_data",
+          "results",
+          "fhir_api_base"
+        ],
+        "field_markers": [
+          "code",
+          "coding",
+          "effectiveDateTime",
+          "reference",
+          "resourceType",
+          "status",
+          "subject",
+          "system",
+          "value"
+        ],
+        "reads_history": false,
+        "queries_fhir": false
+      },
+      "task4": {
+        "n_lines": 23,
+        "args": [
+          "case_data",
+          "results",
+          "fhir_api_base"
+        ],
+        "field_markers": [
+          "code",
+          "effectiveDateTime",
+          "value",
+          "valueQuantity"
+        ],
+        "reads_history": true,
+        "queries_fhir": true
+      },
+      "task5": {
+        "n_lines": 55,
+        "args": [
+          "case_data",
+          "results",
+          "fhir_api_base"
+        ],
+        "field_markers": [
+          "authoredOn",
+          "code",
+          "coding",
+          "dosageInstruction",
+          "effectiveDateTime",
+          "intent",
+          "medicationCodeableConcept",
+          "reference",
+          "resourceType",
+          "status",
+          "subject",
+          "system",
+          "unit",
+          "value",
+          "valueQuantity"
+        ],
+        "reads_history": true,
+        "queries_fhir": true
+      },
+      "task6": {
+        "n_lines": 24,
+        "args": [
+          "case_data",
+          "results",
+          "fhir_api_base"
+        ],
+        "field_markers": [
+          "code",
+          "effectiveDateTime",
+          "value",
+          "valueQuantity"
+        ],
+        "reads_history": true,
+        "queries_fhir": true
+      },
+      "task7": {
+        "n_lines": 21,
+        "args": [
+          "case_data",
+          "results",
+          "fhir_api_base"
+        ],
+        "field_markers": [
+          "code",
+          "effectiveDateTime",
+          "value",
+          "valueQuantity"
+        ],
+        "reads_history": true,
+        "queries_fhir": true
+      },
+      "task8": {
+        "n_lines": 23,
+        "args": [
+          "case_data",
+          "results",
+          "fhir_api_base"
+        ],
+        "field_markers": [
+          "authoredOn",
+          "code",
+          "coding",
+          "intent",
+          "reference",
+          "resourceType",
+          "status",
+          "subject",
+          "system"
+        ],
+        "reads_history": false,
+        "queries_fhir": false
+      },
+      "task9": {
+        "n_lines": 63,
+        "args": [
+          "case_data",
+          "results",
+          "fhir_api_base"
+        ],
+        "field_markers": [
+          "authoredOn",
+          "code",
+          "coding",
+          "dosageInstruction",
+          "effectiveDateTime",
+          "intent",
+          "medicationCodeableConcept",
+          "occurrenceDateTime",
+          "reference",
+          "resourceType",
+          "status",
+          "subject",
+          "system",
+          "unit",
+          "value",
+          "valueQuantity"
+        ],
+        "reads_history": true,
+        "queries_fhir": true
+      },
+      "task10": {
+        "n_lines": 49,
+        "args": [
+          "case_data",
+          "results",
+          "fhir_api_base"
+        ],
+        "field_markers": [
+          "authoredOn",
+          "code",
+          "coding",
+          "effectiveDateTime",
+          "intent",
+          "reference",
+          "resourceType",
+          "status",
+          "subject",
+          "system",
+          "value",
+          "valueQuantity"
+        ],
+        "reads_history": true,
+        "queries_fhir": true
+      }
+    }
+  },
   "verdict": {
     "templating_confirmed": true,
     "n_action_templates": 5,
-    "grader_invertibility_feasible": null,
+    "grader_invertibility_feasible": true,
     "gate": "PASS",
     "notes": [
       "Templating CONFIRMED: 300 tasks over 10 templates; id-grouping and mask-grouping agree.",
       "Effective clusters for action-task analysis: 5 (150 instances). Task-clustered bootstrap resamples templates, so this -- not the instance count -- bounds power.",
       "FEWER THAN 8 ACTION TEMPLATES: ranking estimator families is not achievable. State RQ1 as 'does any estimator beat chance, and by how much'. Note that test_data_v1.json is a strict SUBSET of test_data_v2.json, so combining them adds no clusters -- more templates would have to come from the PSB 2026 task set (ericoericochen/medagentbenchv2), which is a separate acquisition.",
       "Only 30/300 tasks carry a 'sol'. Grading is impossible without refsol.py -- do not report a success rate without it.",
-      "refsol.py absent: grader invertibility UNRESOLVED. Download it from the Box link in the upstream README (and never commit it)."
+      "Graders: 10 task graders, 8 check payload fields, 8 read the transcript.",
+      "Gold-action reconstruction looks FEASIBLE -- graders assert on payload fields, so the expected payload can be derived (plan \u00a74.2)."
     ]
   }
 }

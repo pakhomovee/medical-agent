@@ -68,9 +68,37 @@ Two consequences, both already folded into the plan:
 - **`sol` is null for 9 of 10 templates**, so grading is impossible without `refsol.py`.
   G2 reports INCOMPLETE rather than 0% when it is absent.
 
+### The FHIR server without Docker
+
+Many GPU environments cannot run Docker at all — an AutoDL container drops
+`cap_sys_admin`, so `dockerd` can never start regardless of privileges, and Docker Hub is
+unreachable from some networks. Neither matters: the image is a Spring Boot HAPI FHIR war
+plus a preloaded H2 database, so it runs on a bare JVM.
+
+```bash
+apt-get install -y openjdk-17-jre-headless
+
+python scripts/fetch_fhir_server.py --out ~/fhir            # ~1.8 GB download
+# behind a blocked Docker Hub:
+python scripts/fetch_fhir_server.py --out ~/fhir --registry https://docker.m.daocloud.io
+
+~/fhir/run.sh                                               # starts in ~70s
+```
+
+The puller resolves the manifest, downloads and digest-verifies each layer (cached and
+resumable), applies whiteouts in order, and generates `run.sh` with the image's own
+entrypoint — rewriting the absolute `/data` and `/configs` paths to the extracted tree so
+no root-owned directories are needed.
+
+**Budget ~6 GB of disk**: 1.8 GB compressed layers plus a 4.5 GB `test_db.mv.db`. Pass
+`--keep-blobs` to retain the cache, `--heap 1200m` if RAM is tight.
+
+Verified working: 695 patients, 563k observations, 125k procedures, 75k conditions.
+
 ### G0 — environment readiness (GPU box)
 
 ```bash
+# either the extracted server above, or Docker if you have it
 docker run -d -p 8080:8080 <hapi-fhir-image-from-upstream-readme>
 vllm serve <MODEL> --dtype bfloat16 --max-model-len 8192 \
   --enable-prefix-caching --no-enable-chunked-prefill
@@ -148,8 +176,8 @@ uqma/agent/                parsing (+ canonicalisation) · loop · resample
 uqma/trajectory/           schema (SCHEMA_VERSION 1.0.0) · store (manifests, JSONL)
 uqma/inference/            base · openai_compat (vllm serve) · stub (no GPU)
 scripts/                   g0_environment.py · g1_task_structure.py · g2_model_gate.py
-                           run_agent.py (stage 1)
-tests/                     98 tests, no GPU or network required
+                           run_agent.py (stage 1) · fetch_fhir_server.py
+tests/                     117 tests, no GPU or network required
 results/                   small gate reports (committed -- decision evidence)
 runs/                      sweep artifacts (gitignored -- 1-2 TB)
 ```
@@ -205,6 +233,19 @@ registers as a parity failure:
 .venv/bin/python -m pytest tests/ -q
 ```
 
-98 tests. No GPU, no network, no Docker. The three that matter per plan §6.4 are grader mutation
-tests (not yet written — they need `refsol.py`), harness parity against upstream (gate G4,
-not yet written), and clustered-bootstrap coverage (stage 5, not yet built).
+98 tests. No GPU, no network, no Docker. 117 with `data/refsol.py` present, 104 + 13 skipped
+without it, so a clean checkout still passes.
+
+Of the three the plan calls load-bearing (§6.4): **grader mutation tests are written**
+(`tests/test_grading.py` — a correct payload grades True, and seven mutations plus a
+missing field and a double-POST all grade False); harness parity against upstream (gate
+G4) and clustered-bootstrap coverage (stage 5) are not.
+
+### Grading needs two shims
+
+`refsol.py` opens with `from .utils import *` and calls `send_get_request`, so loading it
+standalone needs a synthetic parent package — provided over our own `FhirClient`. And
+`extract_posts` walks `results.history` expecting *objects* with `.role`/`.content` where
+the assistant is spelled `'agent'` (AgentBench's convention), while our loop stores dicts
+with `'assistant'` as the chat API requires. `GradingInput.from_trajectory` translates.
+Always build grading input through it, never by hand.

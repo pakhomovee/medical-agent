@@ -52,10 +52,7 @@ def check_fhir(api_base: str, timeout: float) -> dict:
     counts: dict[str, int | None] = {}
     for resource in EXPECTED_RESOURCES:
         result = client.get(f"{api_base}/{resource}?_summary=count&_format=json")
-        if not result.ok or not isinstance(result.data, dict):
-            counts[resource] = None
-            continue
-        counts[resource] = result.data.get("total")
+        counts[resource] = _total(result) if result.ok else None
 
     populated = all(isinstance(v, int) and v > 0 for v in counts.values())
     return {
@@ -64,6 +61,22 @@ def check_fhir(api_base: str, timeout: float) -> dict:
         "counts": counts,
         "note": None if populated else "server is up but some resource types are empty",
     }
+
+
+def _total(result) -> int | None:
+    """Pull ``Bundle.total`` out of a FHIR count response.
+
+    The client deliberately returns FHIR bodies as text, because HAPI sends
+    'application/fhir+json' and upstream's harness feeds the model that raw text
+    (see uqma/envs/medagentbench/fhir.py). So parse it here rather than there.
+    """
+    payload = result.data
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return payload.get("total") if isinstance(payload, dict) else None
 
 
 def check_model_server(base_url: str, timeout: float) -> dict:

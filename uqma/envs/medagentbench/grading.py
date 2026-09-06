@@ -5,18 +5,42 @@ certainly to keep the answer key out of training crawls. It is gitignored here a
 never be committed -- see plan §6.1, which also flags that our derived turn-level labels
 inherit the same constraint and need a gated release.
 
-Because ``sol`` is ``null`` for 9 of the 10 v1 templates, the task file alone cannot
-grade anything: the graders recompute expected answers by querying FHIR and by reading
-the POST payload out of the conversation history. So without ``refsol.py`` there is no
-success rate at all, and gate G2 must say so rather than silently reporting zero.
+Because ``sol`` is ``null`` for 9 of the 10 v1 templates, the task file alone cannot grade
+anything: the graders recompute expected answers by querying FHIR, and read the POST
+payload out of the conversation history -- which is the only place it exists, since POSTs
+are never sent to the server. So without ``refsol.py`` there is no success rate at all,
+and callers must say so rather than silently reporting zero.
+
+Two shims are needed to run upstream graders against our trajectories:
+
+* ``refsol.py`` opens with ``from .utils import *`` and calls ``send_get_request``. Loaded
+  standalone that relative import fails, so we install a synthetic parent package whose
+  ``utils`` provides that function via our own ``FhirClient``.
+* ``extract_posts`` walks ``results.history`` expecting **objects** with ``.role`` and
+  ``.content``, and expects the assistant role to be spelled ``'agent'`` (AgentBench's
+  convention). Our loop stores dicts with ``'assistant'``, as the chat API requires, so
+  ``GradingInput.from_trajectory`` translates.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Upstream spells the assistant role this way; graders match on it literally.
+AGENT_ROLE = "agent"
+
+
+@dataclass(frozen=True)
+class Message:
+    """History entry with attribute access, as upstream graders expect."""
+
+    role: str
+    content: str
 
 
 @dataclass
@@ -25,14 +49,72 @@ class GradingInput:
 
     Upstream calls ``grader(case_data, results, fhir_api_base)`` where ``results`` is a
     ``TaskOutput``. Graders read ``.result`` (the FINISH payload) and, for action tasks,
-    ``.history`` -- which is where the POST payload lives, since POSTs are never sent to
-    the server and so leave no trace in FHIR state.
+    ``.history``.
     """
 
     result: str | None
-    history: list[dict] = field(default_factory=list)
+    history: list[Message] = field(default_factory=list)
     status: str = ""
     index: int = 0
+
+    @classmethod
+    def from_trajectory(cls, trajectory) -> GradingInput:
+        """Build grading input from one of our ``Trajectory`` records."""
+        return cls(
+            result=trajectory.result,
+            history=to_agent_history(trajectory.history),
+            status=trajectory.status,
+        )
+
+
+def to_agent_history(history: list[dict]) -> list[Message]:
+    """Convert our dict transcript to upstream's attribute-and-``agent`` form."""
+    return [
+        Message(
+            role=AGENT_ROLE if entry.get("role") == "assistant" else entry.get("role", ""),
+            content=entry.get("content") or "",
+        )
+        for entry in history
+    ]
+
+
+def _make_utils_module(fhir_api_base: str) -> types.ModuleType:
+    """Provide the ``utils`` names ``refsol`` star-imports.
+
+    Implemented over our own client rather than vendoring upstream's file, so there is a
+    single HTTP path and one place where timeouts and truncation are configured.
+    """
+    from .fhir import FhirClient
+
+    module = types.ModuleType("uqma_refsol_pkg.utils")
+    client = FhirClient(fhir_api_base, max_chars=None)
+
+    def send_get_request(url, params=None, headers=None):
+        # Upstream's contract: {"status_code", "data"} on success, {"error"} otherwise.
+        result = client.get(url if not params else f"{url}?{_encode(params)}")
+        if not result.ok:
+            return {"error": result.error}
+        data = result.data
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return {"status_code": 200, "data": data}
+
+    def verify_fhir_server(api_base):
+        return FhirClient(api_base).verify()
+
+    module.send_get_request = send_get_request
+    module.verify_fhir_server = verify_fhir_server
+    module.json = json
+    return module
+
+
+def _encode(params: dict) -> str:
+    from urllib.parse import urlencode
+
+    return urlencode(params)
 
 
 class RefsolGrader:
@@ -44,23 +126,30 @@ class RefsolGrader:
 
     def __init__(self, refsol_path: str | Path, fhir_api_base: str) -> None:
         self.refsol_path = Path(refsol_path)
-        self.fhir_api_base = fhir_api_base
-        self._module = self._load(self.refsol_path)
+        self.fhir_api_base = fhir_api_base.rstrip("/") + "/"  # graders build f'{base}Observation'
+        self._module = self._load(self.refsol_path, self.fhir_api_base)
 
     @staticmethod
-    def _load(path: Path):
+    def _load(path: Path, fhir_api_base: str):
         if not path.exists():
             raise FileNotFoundError(
                 f"refsol.py not found at {path}. Download it from the Box link in the "
                 "MedAgentBench README and place it there. It is gitignored on purpose; "
                 "do not commit it."
             )
-        spec = importlib.util.spec_from_file_location("uqma_refsol", path)
+
+        # Synthetic parent package so `from .utils import *` resolves.
+        pkg = types.ModuleType("uqma_refsol_pkg")
+        pkg.__path__ = [str(path.parent)]
+        sys.modules["uqma_refsol_pkg"] = pkg
+        sys.modules["uqma_refsol_pkg.utils"] = _make_utils_module(fhir_api_base)
+
+        spec = importlib.util.spec_from_file_location("uqma_refsol_pkg.refsol", path)
         if spec is None or spec.loader is None:
             raise ImportError(f"could not load a module from {path}")
         module = importlib.util.module_from_spec(spec)
-        # Registered so that any relative machinery inside refsol resolves.
-        sys.modules["uqma_refsol"] = module
+        module.__package__ = "uqma_refsol_pkg"
+        sys.modules["uqma_refsol_pkg.refsol"] = module
         spec.loader.exec_module(module)
         return module
 
@@ -72,12 +161,7 @@ class RefsolGrader:
         )
 
     def grade(self, case_data: dict, output: GradingInput) -> bool:
-        """True if the task passes. Exceptions are swallowed into False, as upstream does.
-
-        Upstream additionally skips grading entirely when ``result`` is None (the agent
-        never called FINISH) and counts those as incorrect; ``grade_task`` below applies
-        that rule so the arithmetic matches.
-        """
+        """True if the task passes. Exceptions are swallowed into False, as upstream does."""
         category = case_data["id"].split("_")[0]
         grader = getattr(self._module, category, None)
         if grader is None:
