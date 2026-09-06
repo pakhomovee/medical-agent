@@ -31,14 +31,13 @@ import subprocess
 import sys
 import tarfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 DEFAULT_REPO = "jyxsu6/medagentbench"
 DEFAULT_TAG = "latest"
 DEFAULT_REGISTRY = "https://registry-1.docker.io"
-DEFAULT_AUTH = "https://auth.docker.io/token"
-DEFAULT_SERVICE = "registry.docker.io"
 
 ACCEPT = ",".join([
     "application/vnd.docker.distribution.manifest.v2+json",
@@ -54,52 +53,83 @@ def _get(url: str, headers: dict, timeout: float = 60.0) -> bytes:
         return response.read()
 
 
-def get_token(registry: str, repo: str, timeout: float) -> str | None:
-    """Fetch a pull token. Mirrors often need none; failure here is not fatal."""
-    if "docker.io" in registry:
-        url = f"{DEFAULT_AUTH}?service={DEFAULT_SERVICE}&scope=repository:{repo}:pull"
-    else:
-        host = registry.split("//", 1)[-1]
-        url = f"{registry}/token?service={host}&scope=repository:{repo}:pull"
+def _parse_challenge(header: str) -> dict:
+    """Parse a WWW-Authenticate Bearer challenge into its parameters.
+
+    ``Bearer realm="https://host/auth/token",service="host"`` -> {"realm": ..., "service": ...}
+    """
+    if not header.lower().startswith("bearer"):
+        return {}
+    params = {}
+    for part in header[len("bearer"):].strip().split(","):
+        key, _, value = part.partition("=")
+        if value:
+            params[key.strip()] = value.strip().strip('"')
+    return params
+
+
+def _token_for(challenge: dict, repo: str, timeout: float) -> str:
+    query = {"scope": f"repository:{repo}:pull"}
+    if challenge.get("service"):
+        query["service"] = challenge["service"]
+    body = json.loads(
+        _get(f"{challenge['realm']}?{urllib.parse.urlencode(query)}", {}, timeout)
+    )
+    token = body.get("token") or body.get("access_token")
+    if not token:
+        raise RuntimeError(f"no token in the response from {challenge['realm']}")
+    return token
+
+
+def open_authed(url: str, repo: str, timeout: float, accept: str | None = None):
+    """Open a registry URL, following a 401 challenge if one comes back.
+
+    Registries put their token endpoint in different places -- Docker Hub uses
+    auth.docker.io, daocloud uses /auth/token on its own host -- and hardcoding either is
+    exactly why the first version of this failed against a mirror. The spec already says
+    where to look: the ``WWW-Authenticate`` header on the 401. Follow it and any mirror
+    works without special-casing.
+    """
+    headers = {"Accept": accept} if accept else {"Accept": "*/*"}
     try:
-        return json.loads(_get(url, {}, timeout)).get("token")
-    except (urllib.error.URLError, ValueError, TimeoutError) as exc:
-        print(f"  note: no token from {url.split('?')[0]} ({exc}); trying anonymously")
-        return None
+        return urllib.request.urlopen(
+            urllib.request.Request(url, headers=headers), timeout=timeout
+        )
+    except urllib.error.HTTPError as exc:
+        if exc.code != 401:
+            raise
+        challenge = _parse_challenge(exc.headers.get("WWW-Authenticate", ""))
+        if not challenge.get("realm"):
+            raise
+    headers["Authorization"] = f"Bearer {_token_for(challenge, repo, timeout)}"
+    return urllib.request.urlopen(
+        urllib.request.Request(url, headers=headers), timeout=timeout
+    )
 
 
-def fetch_manifest(registry: str, repo: str, tag: str, token: str | None, timeout: float) -> dict:
-    headers = {"Accept": ACCEPT}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    raw = _get(f"{registry}/v2/{repo}/manifests/{tag}", headers, timeout)
-    manifest = json.loads(raw)
+def fetch_manifest(registry: str, repo: str, tag: str, timeout: float) -> dict:
+    with open_authed(f"{registry}/v2/{repo}/manifests/{tag}", repo, timeout, ACCEPT) as r:
+        manifest = json.loads(r.read())
 
     # Multi-arch index: pick linux/amd64.
     if "manifests" in manifest:
         for entry in manifest["manifests"]:
             platform = entry.get("platform", {})
             if platform.get("os") == "linux" and platform.get("architecture") == "amd64":
-                return fetch_manifest(registry, repo, entry["digest"], token, timeout)
+                return fetch_manifest(registry, repo, entry["digest"], timeout)
         raise RuntimeError("no linux/amd64 manifest in the image index")
     return manifest
 
 
-def download_blob(
-    registry: str, repo: str, digest: str, dest: Path, token: str | None, timeout: float
-) -> Path:
+def download_blob(registry: str, repo: str, digest: str, dest: Path, timeout: float) -> Path:
     """Download one blob to ``dest``, verifying its digest. Cached and resumable."""
     if dest.exists() and _sha256(dest) == digest.split(":", 1)[1]:
         return dest
 
-    headers = {"Accept": "*/*"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    request = urllib.request.Request(f"{registry}/v2/{repo}/blobs/{digest}", headers=headers)
-
     tmp = dest.with_suffix(".part")
     digester = hashlib.sha256()
-    with urllib.request.urlopen(request, timeout=timeout) as response, tmp.open("wb") as handle:
+    opened = open_authed(f"{registry}/v2/{repo}/blobs/{digest}", repo, timeout)
+    with opened as response, tmp.open("wb") as handle:
         total = int(response.headers.get("Content-Length") or 0)
         done = 0
         while chunk := response.read(1 << 20):
@@ -242,9 +272,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"registry: {registry}\nrepo:     {args.repo}:{args.tag}\nout:      {out}\n")
 
     print("resolving manifest...")
-    token = get_token(registry, args.repo, args.timeout)
     try:
-        manifest = fetch_manifest(registry, args.repo, args.tag, token, args.timeout)
+        manifest = fetch_manifest(registry, args.repo, args.tag, args.timeout)
     except (urllib.error.URLError, TimeoutError, RuntimeError, ValueError) as exc:
         print(f"\nFAILED to fetch the manifest: {exc}\n", file=sys.stderr)
         print("Most likely the registry is unreachable from this network. Try:", file=sys.stderr)
@@ -259,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
     print("downloading config...")
     config = json.loads(
         download_blob(registry, args.repo, manifest["config"]["digest"],
-                      blobs / "config.json", token, args.timeout).read_text(encoding="utf-8")
+                      blobs / "config.json", args.timeout).read_text(encoding="utf-8")
     )
 
     print("downloading layers...")
@@ -267,7 +296,7 @@ def main(argv: list[str] | None = None) -> int:
     for layer in layers:
         paths.append(download_blob(registry, args.repo, layer["digest"],
                                    blobs / layer["digest"].replace(":", "_"),
-                                   token, args.timeout))
+                                   args.timeout))
 
     print("\nextracting...")
     extract_layers(paths, rootfs)

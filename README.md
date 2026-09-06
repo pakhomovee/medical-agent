@@ -79,7 +79,7 @@ plus a preloaded H2 database, so it runs on a bare JVM.
 apt-get install -y openjdk-17-jre-headless
 
 python scripts/fetch_fhir_server.py --out ~/fhir            # ~1.8 GB download
-# behind a blocked Docker Hub:
+# behind a blocked Docker Hub (verified against this mirror):
 python scripts/fetch_fhir_server.py --out ~/fhir --registry https://docker.m.daocloud.io
 
 ~/fhir/run.sh                                               # starts in ~70s
@@ -89,6 +89,11 @@ The puller resolves the manifest, downloads and digest-verifies each layer (cach
 resumable), applies whiteouts in order, and generates `run.sh` with the image's own
 entrypoint — rewriting the absolute `/data` and `/configs` paths to the extracted tree so
 no root-owned directories are needed.
+
+Auth follows the `WWW-Authenticate` challenge on the 401 rather than assuming a token
+endpoint, so **any** mirror works: Docker Hub's realm is `auth.docker.io`, daocloud's is
+`/auth/token` on its own host, and hardcoding either breaks the other. Both are verified
+to return the same config digest, so a mirror serves identical content.
 
 **Budget ~6 GB of disk**: 1.8 GB compressed layers plus a 4.5 GB `test_db.mv.db`. Pass
 `--keep-blobs` to retain the cache, `--heap 1200m` if RAM is tight.
@@ -177,7 +182,7 @@ uqma/trajectory/           schema (SCHEMA_VERSION 1.0.0) · store (manifests, JS
 uqma/inference/            base · openai_compat (vllm serve) · stub (no GPU)
 scripts/                   g0_environment.py · g1_task_structure.py · g2_model_gate.py
                            run_agent.py (stage 1) · fetch_fhir_server.py
-tests/                     117 tests, no GPU or network required
+tests/                     128 tests, no GPU or network required
 results/                   small gate reports (committed -- decision evidence)
 runs/                      sweep artifacts (gitignored -- 1-2 TB)
 ```
@@ -233,7 +238,7 @@ registers as a parity failure:
 .venv/bin/python -m pytest tests/ -q
 ```
 
-98 tests. No GPU, no network, no Docker. 117 with `data/refsol.py` present, 104 + 13 skipped
+98 tests. No GPU, no network, no Docker. 128 with `data/refsol.py` present, 115 + 13 skipped
 without it, so a clean checkout still passes.
 
 Of the three the plan calls load-bearing (§6.4): **grader mutation tests are written**
