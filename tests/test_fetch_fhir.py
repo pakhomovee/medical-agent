@@ -176,3 +176,39 @@ def test_pinned_manifest_matches_the_live_image():
     assert len(manifest["layers"]) == 38
     assert manifest["config"]["digest"].startswith("sha256:a232b7b22b86")
     assert sum(layer["size"] for layer in manifest["layers"]) > 1.8e9
+
+
+def test_stalled_transfer_is_abandoned_so_the_next_mirror_gets_a_turn(tmp_path, monkeypatch):
+    """urllib's timeout is per read, so a trickling mirror hangs forever without this."""
+    import fetch_fhir_server as F
+
+    class Trickle:
+        headers = {"Content-Length": "100000000"}
+
+        def read(self, n):
+            time.sleep(0.02)
+            return b"x"          # one byte per read: never trips a socket timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    import time
+
+    monkeypatch.setattr(F, "open_authed", lambda *a, **k: Trickle())
+    monkeypatch.setattr(F.time, "monotonic", _clock())
+    with pytest.raises(TimeoutError, match="stalled"):
+        F._download_blob_from("https://slow", "r/i", "sha256:x", tmp_path / "b", 5)
+
+
+def _clock():
+    """Monotonic clock that jumps past the grace period after a few calls."""
+    state = {"t": 0.0}
+
+    def now():
+        state["t"] += 20.0
+        return state["t"]
+
+    return now

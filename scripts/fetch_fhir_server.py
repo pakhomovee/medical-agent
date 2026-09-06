@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -157,11 +158,20 @@ def download_blob(
 
 
 def _download_blob_from(
-    registry: str, repo: str, digest: str, dest: Path, timeout: float
+    registry: str, repo: str, digest: str, dest: Path, timeout: float,
+    min_bytes_per_s: float = 20_000.0,
 ) -> Path:
+    """Fetch one blob from one registry, abandoning a stalled transfer.
+
+    ``timeout`` is per socket read, not total, so a mirror trickling a few bytes every
+    interval never trips it and hangs indefinitely. A throughput floor catches that:
+    after a grace period, sustained rate below ``min_bytes_per_s`` raises so the caller
+    can try the next mirror.
+    """
     tmp = dest.with_suffix(".part")
     digester = hashlib.sha256()
     opened = open_authed(f"{registry}/v2/{repo}/blobs/{digest}", repo, timeout)
+    started = time.monotonic()
     with opened as response, tmp.open("wb") as handle:
         total = int(response.headers.get("Content-Length") or 0)
         done = 0
@@ -169,9 +179,17 @@ def _download_blob_from(
             handle.write(chunk)
             digester.update(chunk)
             done += len(chunk)
+            elapsed = time.monotonic() - started
+            if elapsed > 30 and done / elapsed < min_bytes_per_s:
+                tmp.unlink(missing_ok=True)
+                raise TimeoutError(
+                    f"stalled at {done/1e6:.1f} MB ({done/elapsed/1e3:.1f} kB/s)"
+                )
             if total:
                 pct = done * 100 // total
-                print(f"\r    {digest[7:19]}  {done/1e6:7.1f}/{total/1e6:.1f} MB  {pct:3d}%",
+                eta = (total - done) / (done / elapsed) if done and elapsed else 0
+                print(f"\r    {digest[7:19]}  {done/1e6:7.1f}/{total/1e6:.1f} MB  {pct:3d}%  "
+                      f"{done/elapsed/1e6:.1f} MB/s  eta {eta/60:.0f}m   ",
                       end="", flush=True)
     print()
 
