@@ -39,6 +39,16 @@ DEFAULT_REPO = "jyxsu6/medagentbench"
 DEFAULT_TAG = "latest"
 DEFAULT_REGISTRY = "https://registry-1.docker.io"
 
+# Tried in order for each blob. Registries fail independently and intermittently -- a
+# mirror may 403 manifests but serve blobs, rate-limit after a partial pull, or simply be
+# unreachable from a given network -- so falling through beats failing the whole run.
+FALLBACK_REGISTRIES = [
+    "https://registry-1.docker.io",
+    "https://docker.m.daocloud.io",
+    "https://docker.1ms.run",
+    "https://hub.rat.dev",
+]
+
 ACCEPT = ",".join([
     "application/vnd.docker.distribution.manifest.v2+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
@@ -121,11 +131,34 @@ def fetch_manifest(registry: str, repo: str, tag: str, timeout: float) -> dict:
     return manifest
 
 
-def download_blob(registry: str, repo: str, digest: str, dest: Path, timeout: float) -> Path:
-    """Download one blob to ``dest``, verifying its digest. Cached and resumable."""
+def download_blob(
+    registries: list[str] | str, repo: str, digest: str, dest: Path, timeout: float
+) -> Path:
+    """Download one blob, trying each registry in turn. Cached and digest-verified.
+
+    Registries fail independently and intermittently: a mirror may 403 manifests but
+    serve blobs, rate-limit after a partial pull, or be unreachable from one network and
+    fine from another. Falling through beats failing a 1.8 GB run on one bad host.
+    """
+    if isinstance(registries, str):
+        registries = [registries]
     if dest.exists() and _sha256(dest) == digest.split(":", 1)[1]:
         return dest
 
+    last = None
+    for index, registry in enumerate(registries):
+        try:
+            return _download_blob_from(registry, repo, digest, dest, timeout)
+        except Exception as exc:  # any transport or HTTP failure: try the next mirror
+            last = exc
+            remaining = len(registries) - index - 1
+            print(f"    {registry} failed ({type(exc).__name__}); {remaining} mirror(s) left")
+    raise RuntimeError(f"all registries failed for {digest}: {last}")
+
+
+def _download_blob_from(
+    registry: str, repo: str, digest: str, dest: Path, timeout: float
+) -> Path:
     tmp = dest.with_suffix(".part")
     digester = hashlib.sha256()
     opened = open_authed(f"{registry}/v2/{repo}/blobs/{digest}", repo, timeout)
@@ -252,8 +285,10 @@ exec java -Xmx{heap} \\
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Fetch the MedAgentBench FHIR server image")
     parser.add_argument("--out", type=Path, required=True, help="destination directory")
-    parser.add_argument("--registry", default=DEFAULT_REGISTRY,
-                        help="registry base URL; use a mirror if Docker Hub is blocked")
+    parser.add_argument("--registry", action="append", default=None,
+                        help="registry base URL; repeat to set a fallback order. "
+                             "Defaults to Docker Hub plus several mirrors, each tried "
+                             "in turn per blob.")
     parser.add_argument("--repo", default=DEFAULT_REPO)
     parser.add_argument("--tag", default=DEFAULT_TAG)
     parser.add_argument("--manifest", type=Path, default=None,
@@ -261,7 +296,8 @@ def main(argv: list[str] | None = None) -> int:
                              "data/medagentbench_image_manifest.json pins the exact image")
     parser.add_argument("--offline", action="store_true",
                         help="extract from already-downloaded blobs; never touch a registry")
-    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--timeout", type=float, default=45.0,
+                        help="per-request timeout; a dead mirror is abandoned this fast")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--heap", default="2g", help="JVM max heap, e.g. 2g")
     parser.add_argument("--keep-blobs", action="store_true",
@@ -273,8 +309,10 @@ def main(argv: list[str] | None = None) -> int:
     rootfs = out / "rootfs"
     blobs.mkdir(parents=True, exist_ok=True)
 
-    registry = args.registry.rstrip("/")
-    print(f"registry: {registry}\nrepo:     {args.repo}:{args.tag}\nout:      {out}\n")
+    registries = [r.rstrip("/") for r in (args.registry or FALLBACK_REGISTRIES)]
+    registry = registries[0]
+    print("registries:\n" + "\n".join(f"  {r}" for r in registries))
+    print(f"repo:     {args.repo}:{args.tag}\nout:      {out}\n")
 
     cached_manifest = blobs / "manifest.json"
     manifest_source = args.manifest or (cached_manifest if args.offline else None)
@@ -288,9 +326,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     else:
         print("resolving manifest...")
-        try:
-            manifest = fetch_manifest(registry, args.repo, args.tag, args.timeout)
-        except (urllib.error.URLError, TimeoutError, RuntimeError, ValueError) as exc:
+        manifest, exc = None, None
+        for candidate in registries:
+            try:
+                manifest = fetch_manifest(candidate, args.repo, args.tag, args.timeout)
+                print(f"  resolved via {candidate}")
+                break
+            except Exception as err:
+                exc = err
+                print(f"  {candidate} failed ({type(err).__name__})")
+        if manifest is None:
             print(f"\nFAILED to fetch the manifest: {exc}\n", file=sys.stderr)
             print("Options:", file=sys.stderr)
             print("  --manifest data/medagentbench_image_manifest.json   # pinned, no lookup",
@@ -321,14 +366,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print("downloading config...")
         config = json.loads(
-            download_blob(registry, args.repo, manifest["config"]["digest"],
+            download_blob(registries, args.repo, manifest["config"]["digest"],
                           blobs / "config.json", args.timeout).read_text(encoding="utf-8")
         )
 
         print("downloading layers...")
         paths = []
         for layer in layers:
-            paths.append(download_blob(registry, args.repo, layer["digest"],
+            paths.append(download_blob(registries, args.repo, layer["digest"],
                                        blobs / layer["digest"].replace(":", "_"),
                                        args.timeout))
 

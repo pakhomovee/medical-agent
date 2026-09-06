@@ -112,3 +112,67 @@ def test_extraction_is_idempotent(tmp_path):
     extract_layers([layer], rootfs)
     extract_layers([layer], rootfs)
     assert (rootfs / "app/x").read_bytes() == b"v"
+
+
+# --- mirror rotation ------------------------------------------------------------------
+
+def test_download_falls_through_to_a_working_mirror(tmp_path, monkeypatch):
+    """A 1.8 GB pull must not die because one host is refusing today."""
+    import fetch_fhir_server as F
+
+    attempted = []
+
+    def fake(registry, repo, digest, dest, timeout):
+        attempted.append(registry)
+        if registry != "https://good":
+            raise RuntimeError("refused")
+        dest.write_bytes(b"payload")
+        return dest
+
+    monkeypatch.setattr(F, "_download_blob_from", fake)
+    out = F.download_blob(["https://bad1", "https://bad2", "https://good"],
+                          "r/i", "sha256:x", tmp_path / "blob", 5)
+    assert out.read_bytes() == b"payload"
+    assert attempted == ["https://bad1", "https://bad2", "https://good"]
+
+
+def test_download_reports_all_mirrors_failing(tmp_path, monkeypatch):
+    import fetch_fhir_server as F
+
+    monkeypatch.setattr(F, "_download_blob_from",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("nope")))
+    with pytest.raises(RuntimeError, match="all registries failed"):
+        F.download_blob(["https://a", "https://b"], "r/i", "sha256:x", tmp_path / "b", 5)
+
+
+def test_a_bare_registry_string_still_works(tmp_path, monkeypatch):
+    import fetch_fhir_server as F
+
+    monkeypatch.setattr(F, "_download_blob_from",
+                        lambda reg, repo, dig, dest, t: (dest.write_bytes(b"k"), dest)[1])
+    assert F.download_blob("https://one", "r/i", "sha256:x", tmp_path / "b", 5).exists()
+
+
+def test_cached_blob_skips_the_network_entirely(tmp_path, monkeypatch):
+    import hashlib
+
+    import fetch_fhir_server as F
+
+    dest = tmp_path / "blob"
+    dest.write_bytes(b"cached")
+    digest = "sha256:" + hashlib.sha256(b"cached").hexdigest()
+    monkeypatch.setattr(F, "_download_blob_from",
+                        lambda *a, **k: pytest.fail("must not hit the network"))
+    assert F.download_blob(["https://x"], "r/i", digest, dest, 5) == dest
+
+
+def test_pinned_manifest_matches_the_live_image():
+    """The committed manifest pins the exact image; layer count and digest are fixed."""
+    import json
+
+    manifest = json.loads(
+        Path("data/medagentbench_image_manifest.json").read_text(encoding="utf-8")
+    )
+    assert len(manifest["layers"]) == 38
+    assert manifest["config"]["digest"].startswith("sha256:a232b7b22b86")
+    assert sum(layer["size"] for layer in manifest["layers"]) > 1.8e9
