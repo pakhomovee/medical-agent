@@ -147,3 +147,20 @@ def test_per_template_summary_marks_action_templates():
     per = summarise(rows)["per_template"]
     assert per["task8"]["is_action"] is True
     assert per["task2"]["is_action"] is False
+
+
+def test_g2_writes_the_grade_into_the_logged_trajectory(tmp_path, monkeypatch):
+    """summary.json is not the artifact stages 4-6 read -- episodes.jsonl is.
+
+    A log whose `correct` is always None cannot train a probe or evaluate an estimator,
+    however correct the printed summary looks.
+    """
+    import json
+
+    from uqma.trajectory.schema import Trajectory
+
+    trajectory = Trajectory(task_id="task3_1", category="task3", status="completed",
+                            result="[]")
+    assert trajectory.correct is None
+    trajectory.correct = True
+    assert json.loads(json.dumps(trajectory.to_dict()))["correct"] is True

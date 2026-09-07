@@ -90,16 +90,25 @@ def _make_utils_module(fhir_api_base: str) -> types.ModuleType:
     client = FhirClient(fhir_api_base, max_chars=None)
 
     def send_get_request(url, params=None, headers=None):
-        # Upstream's contract: {"status_code", "data"} on success, {"error"} otherwise.
+        """Upstream's contract: {"status_code", "data"} on success, {"error"} otherwise.
+
+        ``data`` MUST be the raw response text, not a parsed object. Upstream's version
+        only parses when the content type contains 'application/json', and HAPI sends
+        'application/fhir+json' -- so in practice upstream always returns text, and the
+        graders call ``json.loads`` on it themselves:
+
+            get_res = json.loads(send_get_request(url)['data'])
+
+        Handing back a dict makes that raise TypeError, which the graders swallow in a
+        bare ``except`` and turn into False. Every FHIR-querying grader (task2, 4, 6, 7,
+        9, 10) then fails regardless of the agent's answer, and the whole run reads 0%.
+        """
         result = client.get(url if not params else f"{url}?{_encode(params)}")
         if not result.ok:
             return {"error": result.error}
         data = result.data
-        if isinstance(data, str):
-            try:
-                data = json.loads(data)
-            except (json.JSONDecodeError, ValueError):
-                pass
+        if not isinstance(data, str):
+            data = json.dumps(data)
         return {"status_code": 200, "data": data}
 
     def verify_fhir_server(api_base):

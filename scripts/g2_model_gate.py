@@ -331,11 +331,11 @@ def main(argv: list[str] | None = None) -> int:
             task, backend, fhir, functions, max_round=args.max_round,
             capture_logprobs=True, strip_think=args.strip_think,
         )
-        correct = grade_task(
-            grader,
-            raw[task.id],
-            GradingInput.from_trajectory(episode),
-        )
+        correct = grade_task(grader, raw[task.id], GradingInput.from_trajectory(episode))
+        # Write it back onto the trajectory too: episodes.jsonl is the artifact stages
+        # 4-6 read, and a log whose `correct` is always None cannot train or evaluate
+        # anything, however good summary.json looks.
+        episode.correct = correct
         row = {
             "task_id": task.id,
             "category": task.category,

@@ -173,3 +173,57 @@ def test_refsol_relative_import_shim_works(grader):
 
     assert "uqma_refsol_pkg.utils" in sys.modules
     assert callable(sys.modules["uqma_refsol_pkg.utils"].send_get_request)
+
+
+# --- the send_get_request contract ----------------------------------------------------
+
+
+def _utils_with(response):
+    """Build the refsol utils shim over a stubbed FHIR client."""
+    import types
+
+    from uqma.envs.medagentbench import fhir as fhir_mod
+    from uqma.envs.medagentbench import grading as G
+
+    real = fhir_mod.FhirClient
+    try:
+        fhir_mod.FhirClient = lambda *a, **k: types.SimpleNamespace(
+            get=lambda url: response, verify=lambda: True
+        )
+        return G._make_utils_module(API_BASE)
+    finally:
+        fhir_mod.FhirClient = real
+
+
+def test_send_get_request_returns_text_not_a_parsed_object():
+    """Graders do ``json.loads(send_get_request(url)['data'])``.
+
+    Upstream only parses when the content type contains 'application/json', and HAPI
+    sends 'application/fhir+json' -- so upstream always hands back text. Returning a dict
+    makes the graders' json.loads raise TypeError, which their bare except turns into
+    False, so every FHIR-querying task (task2, 4, 6, 7, 9, 10) fails regardless of the
+    agent's answer and the whole run reads 0%.
+    """
+    from uqma.envs.medagentbench.fhir import GetResult
+
+    utils = _utils_with(GetResult(ok=True, data='{"resourceType":"Bundle","total":1}'))
+    out = utils.send_get_request(f"{API_BASE}/Patient")
+    assert isinstance(out["data"], str)
+    assert json.loads(out["data"])["total"] == 1      # exactly what a grader does
+
+
+def test_send_get_request_serialises_a_dict_body_back_to_text():
+    """Defensive: if a server ever does send application/json, still hand back text."""
+    from uqma.envs.medagentbench.fhir import GetResult
+
+    utils = _utils_with(GetResult(ok=True, data={"resourceType": "Bundle", "total": 2}))
+    out = utils.send_get_request(f"{API_BASE}/Patient")
+    assert isinstance(out["data"], str)
+    assert json.loads(out["data"])["total"] == 2
+
+
+def test_send_get_request_error_shape_is_preserved():
+    from uqma.envs.medagentbench.fhir import GetResult
+
+    utils = _utils_with(GetResult(ok=False, error="refused"))
+    assert utils.send_get_request(f"{API_BASE}/Patient") == {"error": "refused"}
