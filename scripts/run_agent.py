@@ -60,6 +60,8 @@ def build_backend(args):
         model=args.model or "",
         temperature=args.temperature,
         max_tokens=args.max_tokens,
+        extra_body=({"chat_template_kwargs": {"enable_thinking": False}}
+                    if args.no_thinking else None),
     )
     if not backend.model:
         backend.discover_model()
@@ -88,6 +90,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--n-samples", type=int, default=0,
                         help="k alternatives per turn, history pinned (0 disables)")
     parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--no-thinking", action="store_true",
+                        help="ask the model to skip reasoning via "
+                             "chat_template_kwargs={'enable_thinking': False}. Works on "
+                             "Qwen3 and friends. SCAFFOLD CHANGE -- record it as a tier")
     parser.add_argument("--strip-think", action="store_true",
                         help="strip <think> blocks before dispatch (reasoning models). "
                              "SCAFFOLD CHANGE -- record it as a named tier, see plan §8")
@@ -132,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         "sample_temperature": args.sample_temperature,
         "n_samples": args.n_samples,
         "strip_think": args.strip_think,
+        "no_thinking": args.no_thinking,
         "max_round": args.max_round,
         "max_tokens": args.max_tokens,
         "seed": args.seed,

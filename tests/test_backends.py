@@ -110,3 +110,26 @@ def test_model_discovery_when_unset():
     session = FakeSession(FakeResponse(_completion("x")))
     backend = OpenAICompatBackend(session=session)
     assert backend.discover_model() == "fake-model"
+
+
+def test_chat_template_kwargs_are_forwarded():
+    """Disabling reasoning has to reach the server, not just our parser.
+
+    Qwen3 emits <think> by default; on MedAgentBench that produced 100% invalid actions,
+    and nearly half the turns hit max_tokens mid-thought so stripping could not recover
+    them either. The fix has to be at generation time.
+    """
+    session = FakeSession(FakeResponse(_completion("GET http://x?a=1")))
+    backend = OpenAICompatBackend(
+        model="m", session=session,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    )
+    backend.generate([{"role": "user", "content": "hi"}])
+    sent = session.posts[-1]["json"]
+    assert sent["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_no_extra_body_leaves_the_request_clean():
+    session = FakeSession(FakeResponse(_completion("x")))
+    OpenAICompatBackend(model="m", session=session).generate([{"role": "user", "content": "hi"}])
+    assert "chat_template_kwargs" not in session.posts[-1]["json"]
