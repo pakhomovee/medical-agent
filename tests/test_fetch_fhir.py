@@ -299,3 +299,19 @@ def test_check_rejects_a_registry_whose_manifest_fails_the_pin(monkeypatch):
     monkeypatch.setattr(F, "verify_against_pin",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("MISMATCH\nline2")))
     assert F.check(["https://evil"], "r/i", "latest", 5) == []
+
+
+def test_launcher_binds_loopback_by_default(tmp_path):
+    """The packaged config sets no address, so Spring Boot would bind 0.0.0.0 -- an
+    unauthenticated FHIR API on every interface. Everything here is same-host."""
+    import fetch_fhir_server as F
+
+    text = F.write_launcher(tmp_path / "r", tmp_path, 8080, "2g").read_text(encoding="utf-8")
+    assert 'SERVER_ADDRESS="${FHIR_BIND:-127.0.0.1}"' in text
+
+
+def test_launcher_bind_is_overridable(tmp_path):
+    import fetch_fhir_server as F
+
+    text = F.write_launcher(tmp_path / "r", tmp_path, 8080, "2g").read_text(encoding="utf-8")
+    assert "FHIR_BIND" in text          # documented escape hatch, not hardcoded

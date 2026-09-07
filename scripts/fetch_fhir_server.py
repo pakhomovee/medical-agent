@@ -353,6 +353,12 @@ fi
 export SPRING_CONFIG_LOCATION="file://$ROOTFS/configs/application.local.yaml"
 export SERVER_PORT="{port}"
 
+# Bind loopback only. The packaged config sets no server address, so Spring Boot would
+# default to 0.0.0.0 -- an unauthenticated FHIR REST API, reachable from anywhere the
+# host is. Every consumer here is same-host, so there is no reason to listen wider.
+# Override with FHIR_BIND=0.0.0.0 only if something genuinely needs remote access.
+export SERVER_ADDRESS="${{FHIR_BIND:-127.0.0.1}}"
+
 exec "$JAVA" -Xmx{heap} \\
   --class-path "$ROOTFS/app/main.war" \\
   '-Dloader.path=main.war!/WEB-INF/classes/,main.war!/WEB-INF/,{rootfs}/app/extra-classes' \\
